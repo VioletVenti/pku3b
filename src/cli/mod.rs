@@ -5,6 +5,8 @@ mod cmd_bark;
 mod cmd_course_content;
 mod cmd_course_table;
 mod cmd_grades;
+#[cfg(feature = "mcp")]
+mod cmd_mcp;
 mod cmd_syllabus;
 #[cfg(feature = "thesislib")]
 mod cmd_thesis_lib;
@@ -110,6 +112,10 @@ enum Commands {
     /// 查询课程成绩
     #[command(visible_alias("g"))]
     Grades(cmd_grades::CommandGrades),
+
+    /// 启动 MCP server (JSON-RPC over stdio), 暴露只读教学网工具
+    #[cfg(feature = "mcp")]
+    Mcp(cmd_mcp::CommandMcp),
 
     /// 学位论文检索
     #[cfg(feature = "thesislib")]
@@ -350,6 +356,9 @@ pub async fn start(cli: Cli, m: &MultiProgress) -> anyhow::Result<()> {
             Commands::Video(cmd) => cmd_video::run(cmd, &ctx).await?,
             Commands::Grades(cmd) => cmd_grades::run(cmd, &ctx).await?,
             Commands::Syllabus(cmd) => cmd_syllabus::run(cmd, &ctx).await?,
+
+            #[cfg(feature = "mcp")]
+            Commands::Mcp(cmd) => cmd_mcp::run(cmd, &ctx).await?,
 
             #[cfg(feature = "ttshitu")]
             Commands::Ttshitu(cmd) => cmd_ttshitu::run(cmd, &ctx).await?,
