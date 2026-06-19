@@ -79,6 +79,11 @@ shadow-rs = { version = "1.0", features = ["build"], default-features = false }
 dev = []
 default = ["video-download", "autoelect", "bark", "thesislib-pdf"]
 
+# MCP server: expose pku3b's read-only capabilities as MCP tools over stdio
+# (`pku3b mcp`). Not in `default` — building the plain CLI is unaffected.
+# Build with: cargo build --features mcp
+mcp = []
+
 # support for downloading videos
 aes = ["dep:aes"]
 cbc = ["dep:cbc"]

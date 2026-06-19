@@ -4,6 +4,8 @@ mod api;
 mod cli;
 mod config;
 mod http;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod multipart;
 #[cfg(feature = "pdf")]
 mod pdf;
