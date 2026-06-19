@@ -2,20 +2,25 @@
 //!
 //! One catalog, two consumers (architecture decision #3): the stdio transport
 //! drives it from JSON-RPC, and in-process tests call [`ToolRegistry::call`]
-//! directly without any transport. The deterministic Python path will later
-//! call these same tools over MCP, never through the LLM.
+//! directly without any transport. The deterministic Python path calls these
+//! same tools over MCP, never through the LLM.
 //!
-//! The interface is small — [`ToolRegistry::specs`] + [`ToolRegistry::call`] —
-//! while the implementation hides all of pku3b's `api::*` orchestration (build
-//! client, log in, crawl, serialize). Every tool here is **read-only**; the one
-//! side-effecting method in the API (`CourseAssignment::submit_file`) is
-//! deliberately not exposed.
+//! The interface is small — [`tool_specs`] + [`ToolRegistry::call`] — while the
+//! implementation hides all of pku3b's `api::*` orchestration (build client, log
+//! in, crawl, serialize). All data tools are read-only; the one side-effecting
+//! API method (`CourseAssignment::submit_file`) is deliberately not exposed.
+//! `login` is the only non-read-only tool (it establishes a session).
+//!
+//! ## Sessions / OTP
+//! The HTTP client (and its cookie jar) lives for the whole `pku3b mcp` process,
+//! so a single [`ToolRegistry::login`] with an OTP warms the session and every
+//! later call reuses it — no per-call OTP. Course-table reuse is explicit: we
+//! try the existing portal cookies first and only log in when they're stale.
 //!
 //! ## Result envelope
-//! Every tool returns a uniform JSON envelope so both consumers branch on one
-//! field:
 //! - `{"status":"ok","data": <payload>}`
 //! - `{"status":"needs_otp","mobile_mask": <str|null>,"hint": <str>}`
+//! - `{"status":"error","message": <str>}`
 
 use anyhow::Context as _;
 use serde_json::{Value, json};
@@ -42,11 +47,8 @@ pub enum ToolError {
 }
 
 /// The deep module behind Seam 1. Holds the HTTP client and the config path,
-/// and dispatches tool calls. Credentials are read **lazily** (only when a tool
-/// actually needs to log in) so the server can `initialize` and `tools/list`
-/// even before the user has configured/authenticated. Acquiring per-service
-/// session handles is likewise done per call (cheap when Blackboard cookies are
-/// warm); caching is a future optimization that does not change this interface.
+/// and dispatches tool calls. Credentials are read **lazily** so the server can
+/// `initialize` and `tools/list` before the user has configured/authenticated.
 pub struct ToolRegistry {
     client: api::Client,
     config_path: PathBuf,
@@ -81,6 +83,17 @@ impl ToolRegistry {
         })
     }
 
+    /// Persist the current cookie jar so the warmed session survives restarts.
+    async fn save_session(&self) {
+        if let Err(e) = self
+            .client
+            .save_set_cookies(utils::default_user_agent_data_path())
+            .await
+        {
+            log::warn!("保存会话 cookie 失败: {e:#}");
+        }
+    }
+
     /// The catalog rendered as MCP `tools/list` entries.
     pub fn list_mcp(&self) -> Vec<Value> {
         tool_specs()
@@ -99,16 +112,21 @@ impl ToolRegistry {
     /// Dispatch a tool call by name. Returns the uniform result envelope, or a
     /// [`ToolError`]. Unknown names are rejected before any network work.
     pub async fn call(&self, name: &str, args: Value) -> Result<Value, ToolError> {
+        let otp = args
+            .get("otp")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
         let result = match name {
-            "get_course_table" => self.get_course_table().await,
+            "login" => self.login(otp).await,
+            "get_course_table" => self.get_course_table(otp).await,
             "list_assignments" => {
                 let include_finished = args
                     .get("include_finished")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                self.list_assignments(include_finished).await
+                self.list_assignments(include_finished, otp).await
             }
-            "get_grades" => self.get_grades().await,
+            "get_grades" => self.get_grades(otp).await,
             other => return Err(ToolError::UnknownTool(other.to_string())),
         };
         result.map_err(|e| ToolError::Internal(format!("{e:#}")))
@@ -116,28 +134,84 @@ impl ToolRegistry {
 
     // ---- tool implementations (the hidden depth) --------------------------
 
-    async fn get_course_table(&self) -> anyhow::Result<Value> {
+    /// One-time login: warm the portal + Blackboard sessions with an OTP, then
+    /// persist. After this, the long-lived process reuses the session.
+    async fn login(&self, otp: Option<&str>) -> anyhow::Result<Value> {
         let cfg = self.cfg().await?;
-        let portal = match auth::login_portal(&self.client, &cfg, None).await? {
-            LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
-            LoginOutcome::Ready(p) => p,
+        let Some(otp) = otp else {
+            return Ok(needs_otp(None)); // UI must collect an OTP first
         };
-        let raw = portal.get_my_course_table().await.context("获取课表")?;
-        // The portal returns a JSON string; surface it structured when possible.
-        let data = serde_json::from_str::<Value>(&raw).unwrap_or(Value::String(raw));
-        Ok(ok(data))
+
+        // Portal first (the user's primary target). A 2FA OTP is typically
+        // single-use, so this consumes it.
+        let portal = matches!(
+            auth::login_portal(&self.client, &cfg, Some(otp)).await,
+            Ok(LoginOutcome::Ready(_))
+        );
+
+        // Blackboard best-effort: IAAA may carry the session via SSO. Confirm by
+        // actually listing courses (guards against the cold-preflight false
+        // positive where a handle is returned but isn't really authenticated).
+        let blackboard = match auth::login_blackboard(&self.client, &cfg, Some(otp)).await {
+            Ok(LoginOutcome::Ready(bb)) => bb.get_courses(true).await.is_ok(),
+            _ => false,
+        };
+
+        self.save_session().await;
+
+        if !portal && !blackboard {
+            return Ok(json!({
+                "status": "error",
+                "message": "登录失败：请确认手机令牌 (OTP) 正确且未过期, 然后重试。"
+            }));
+        }
+        Ok(ok(json!({ "portal": portal, "blackboard": blackboard })))
     }
 
-    async fn list_assignments(&self, include_finished: bool) -> anyhow::Result<Value> {
+    async fn get_course_table(&self, otp: Option<&str>) -> anyhow::Result<Value> {
+        // 1. Reuse an existing (warm) portal session — no login, no OTP.
+        if let Ok(raw) = self.client.portal_my_course_table_get("", "").await
+            && let Ok(v) = serde_json::from_str::<Value>(&raw)
+            && (v.get("course").is_some() || v.get("nowXnxq").is_some())
+        {
+            return Ok(ok(v));
+        }
+        // 2. Cold / expired -> log in (needs OTP for a 2FA account).
         let cfg = self.cfg().await?;
-        let bb = match auth::login_blackboard(&self.client, &cfg, None).await? {
+        match auth::login_portal(&self.client, &cfg, otp).await? {
+            LoginOutcome::NeedsOtp { mobile_mask } => Ok(needs_otp(mobile_mask)),
+            LoginOutcome::Ready(portal) => {
+                self.save_session().await;
+                let raw = portal.get_my_course_table().await.context("获取课表")?;
+                let data = serde_json::from_str::<Value>(&raw).unwrap_or(Value::String(raw));
+                Ok(ok(data))
+            }
+        }
+    }
+
+    async fn list_assignments(
+        &self,
+        include_finished: bool,
+        otp: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        let cfg = self.cfg().await?;
+        let bb = match auth::login_blackboard(&self.client, &cfg, otp).await? {
             LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
             LoginOutcome::Ready(b) => b,
         };
+        self.save_session().await;
 
-        let handles = bb.get_courses(true).await.context("获取课程列表")?;
+        let handles = match bb.get_courses(true).await {
+            Ok(h) => h,
+            // "courses not found" almost always means the Blackboard session
+            // isn't actually valid (cold preflight) -> ask the user to log in.
+            Err(e) => {
+                log::warn!("获取课程列表失败: {e:#}");
+                return Ok(needs_otp(None));
+            }
+        };
+
         let mut items: Vec<Value> = Vec::new();
-
         for handle in handles {
             let course = handle.get().await.context("获取课程")?;
             let course_name = course.meta().name().to_owned();
@@ -185,14 +259,21 @@ impl ToolRegistry {
         ))
     }
 
-    async fn get_grades(&self) -> anyhow::Result<Value> {
+    async fn get_grades(&self, otp: Option<&str>) -> anyhow::Result<Value> {
         let cfg = self.cfg().await?;
-        let bb = match auth::login_blackboard(&self.client, &cfg, None).await? {
+        let bb = match auth::login_blackboard(&self.client, &cfg, otp).await? {
             LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
             LoginOutcome::Ready(b) => b,
         };
+        self.save_session().await;
 
-        let user_id = bb.user_info_id().await.context("获取用户信息")?;
+        let user_id = match bb.user_info_id().await {
+            Ok(id) => id,
+            Err(e) => {
+                log::warn!("获取用户信息失败: {e:#}");
+                return Ok(needs_otp(None));
+            }
+        };
         let mut enrollments = bb.user_courses(&user_id).await.context("获取选课列表")?;
         enrollments.retain(|e| e.course_role_id == "Student");
 
@@ -222,8 +303,20 @@ impl ToolRegistry {
     }
 }
 
-fn empty_object_schema() -> Value {
-    json!({ "type": "object", "properties": {}, "additionalProperties": false })
+/// Schema for a data tool: an optional `otp` (usually omitted after `login`).
+fn otp_optional_schema(extra: Value) -> Value {
+    let mut props = json!({
+        "otp": {
+            "type": "string",
+            "description": "手机令牌 (OTP); 一般先用 login 登录后此处可省略。"
+        }
+    });
+    if let (Some(props), Some(extra)) = (props.as_object_mut(), extra.as_object()) {
+        for (k, v) in extra {
+            props.insert(k.clone(), v.clone());
+        }
+    }
+    json!({ "type": "object", "properties": props, "additionalProperties": false })
 }
 
 /// The static tool catalog. Free function so it is testable without building a
@@ -231,10 +324,24 @@ fn empty_object_schema() -> Value {
 fn tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
+            name: "login",
+            title: "登录教学网",
+            description: "用手机令牌 (OTP) 登录教学网, 一次性建立会话 (门户 + Blackboard)。\
+                          登录后本次运行内的查询无需再次输入 OTP, 直到会话过期。\
+                          OTP 必须由用户提供, 不要自行编造。",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "otp": { "type": "string", "description": "手机令牌 (OTP) 6 位码" } },
+                "required": ["otp"],
+                "additionalProperties": false
+            }),
+            read_only: false,
+        },
+        ToolSpec {
             name: "get_course_table",
             title: "个人课表",
             description: "获取当前学期的个人课表 (来自校内门户)。返回每天每节次的课程信息。",
-            input_schema: empty_object_schema(),
+            input_schema: otp_optional_schema(json!({})),
             read_only: true,
         },
         ToolSpec {
@@ -242,23 +349,19 @@ fn tool_specs() -> Vec<ToolSpec> {
             title: "作业列表 (含 DDL)",
             description: "列出本学期课程的作业及截止时间, 默认只返回未提交的作业。\
                           适合回答 \"这周哪些作业要交 / 按 DDL 排序\" 一类问题。",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "include_finished": {
-                        "type": "boolean",
-                        "description": "是否包含已提交/已完成的作业, 默认 false (只看未完成)。"
-                    }
-                },
-                "additionalProperties": false
-            }),
+            input_schema: otp_optional_schema(json!({
+                "include_finished": {
+                    "type": "boolean",
+                    "description": "是否包含已提交/已完成的作业, 默认 false (只看未完成)。"
+                }
+            })),
             read_only: true,
         },
         ToolSpec {
             name: "get_grades",
             title: "成绩查询",
             description: "查询当前学期各门课程已公布的成绩条目 (作业/总评等)。",
-            input_schema: empty_object_schema(),
+            input_schema: otp_optional_schema(json!({})),
             read_only: true,
         },
     ]
@@ -272,7 +375,7 @@ fn needs_otp(mobile_mask: Option<String>) -> Value {
     json!({
         "status": "needs_otp",
         "mobile_mask": mobile_mask,
-        "hint": "教学网会话已过期或需要手机令牌 (OTP)。请先在终端运行 `pku3b ct` 完成一次登录以刷新会话, 然后重试。"
+        "hint": "需要登录教学网。请用手机令牌 (OTP) 登录一次 (网页端登录入口 / login 工具), 之后无需重复输入。"
     })
 }
 
@@ -281,34 +384,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_is_read_only_and_named() {
+    fn catalog_named_and_login_is_only_non_read_only() {
         let specs = tool_specs();
         let names: Vec<_> = specs.iter().map(|s| s.name).collect();
+        assert!(names.contains(&"login"));
         assert!(names.contains(&"get_course_table"));
         assert!(names.contains(&"list_assignments"));
         assert!(names.contains(&"get_grades"));
-        // P0 exposes read-only tools only — submit_file must never appear.
-        assert!(specs.iter().all(|s| s.read_only));
+        // Data tools are read-only; `login` is the only stateful one.
+        for s in &specs {
+            assert_eq!(
+                s.read_only,
+                s.name != "login",
+                "read_only wrong for {}",
+                s.name
+            );
+        }
+        // No write/side-effecting data tool is exposed.
         assert!(!names.contains(&"submit_assignment"));
     }
 
     #[test]
-    fn mcp_listing_uses_camelcase_input_schema() {
-        // tools/list entries must use `inputSchema` (MCP) and a closed schema.
-        let s = &tool_specs()[0];
-        let mcp = json!({
-            "name": s.name,
-            "inputSchema": s.input_schema,
-        });
-        assert!(mcp.get("inputSchema").is_some());
-        assert_eq!(mcp["inputSchema"]["type"], "object");
+    fn data_tools_accept_optional_otp() {
+        let s = otp_optional_schema(json!({}));
+        assert_eq!(s["type"], "object");
+        assert_eq!(s["additionalProperties"], false);
+        assert!(s["properties"]["otp"].is_object());
     }
 
     #[test]
-    fn empty_schema_is_closed_object() {
-        let s = empty_object_schema();
-        assert_eq!(s["type"], "object");
-        assert_eq!(s["additionalProperties"], false);
+    fn assignments_schema_merges_extra_props() {
+        let s = otp_optional_schema(json!({"include_finished": {"type": "boolean"}}));
+        assert!(s["properties"]["otp"].is_object());
+        assert!(s["properties"]["include_finished"].is_object());
+    }
+
+    #[test]
+    fn login_requires_otp_in_schema() {
+        let login = tool_specs()
+            .into_iter()
+            .find(|s| s.name == "login")
+            .unwrap();
+        assert_eq!(login.input_schema["required"][0], "otp");
     }
 
     #[test]
