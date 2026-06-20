@@ -134,38 +134,74 @@ impl ToolRegistry {
 
     // ---- tool implementations (the hidden depth) --------------------------
 
-    /// One-time login: warm the portal + Blackboard sessions with an OTP, then
-    /// persist. After this, the long-lived process reuses the session.
+    /// One-time login: warm the teaching-network session with an OTP, then
+    /// persist. A single IAAA OTP authenticates **one** service, so we only
+    /// spend it on a service that isn't already warm — call this again with a
+    /// fresh OTP to connect the other. After warming, the long-lived process
+    /// reuses the session (no per-call OTP).
     async fn login(&self, otp: Option<&str>) -> anyhow::Result<Value> {
         let cfg = self.cfg().await?;
+
+        // Portal warmth is a cheap GET (no login, no OTP spent).
+        let portal_warm = self.portal_warm().await;
+
         let Some(otp) = otp else {
             return Ok(needs_otp(None)); // UI must collect an OTP first
         };
 
-        // Portal first (the user's primary target). A 2FA OTP is typically
-        // single-use, so this consumes it.
-        let portal = matches!(
-            auth::login_portal(&self.client, &cfg, Some(otp)).await,
-            Ok(LoginOutcome::Ready(_))
-        );
+        let mut portal_ok = portal_warm;
+        let blackboard_ok;
 
-        // Blackboard best-effort: IAAA may carry the session via SSO. Confirm by
-        // actually listing courses (guards against the cold-preflight false
-        // positive where a handle is returned but isn't really authenticated).
-        let blackboard = match auth::login_blackboard(&self.client, &cfg, Some(otp)).await {
-            Ok(LoginOutcome::Ready(bb)) => bb.get_courses(true).await.is_ok(),
-            _ => false,
-        };
+        if !portal_warm {
+            // First OTP -> portal (the primary target; this consumes the OTP).
+            portal_ok = matches!(
+                auth::login_portal(&self.client, &cfg, Some(otp)).await,
+                Ok(LoginOutcome::Ready(_))
+            );
+            if portal_ok {
+                self.save_session().await;
+            }
+            // Best-effort: IAAA *might* carry the session to Blackboard with no
+            // second OTP. One attempt with an empty OTP; if it fails the user
+            // re-logs in with a fresh OTP and the `else` branch warms Blackboard.
+            blackboard_ok = self.try_blackboard(&cfg, None).await;
+        } else {
+            // Portal already connected -> spend this (fresh) OTP on Blackboard.
+            blackboard_ok = self.try_blackboard(&cfg, Some(otp)).await;
+        }
+        if blackboard_ok {
+            self.save_session().await;
+        }
 
-        self.save_session().await;
-
-        if !portal && !blackboard {
+        if !portal_ok && !blackboard_ok {
             return Ok(json!({
                 "status": "error",
                 "message": "登录失败：请确认手机令牌 (OTP) 正确且未过期, 然后重试。"
             }));
         }
-        Ok(ok(json!({ "portal": portal, "blackboard": blackboard })))
+        Ok(ok(
+            json!({ "portal": portal_ok, "blackboard": blackboard_ok }),
+        ))
+    }
+
+    /// True if the portal session is usable right now (reuses cookies, no login).
+    async fn portal_warm(&self) -> bool {
+        if let Ok(raw) = self.client.portal_my_course_table_get("", "").await
+            && let Ok(v) = serde_json::from_str::<Value>(&raw)
+            && (v.get("course").is_some() || v.get("nowXnxq").is_some())
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Try to establish/confirm a Blackboard session; verify by listing courses
+    /// (guards the cold-preflight false positive). Returns whether it's usable.
+    async fn try_blackboard(&self, cfg: &config::Config, otp: Option<&str>) -> bool {
+        match auth::login_blackboard(&self.client, cfg, otp).await {
+            Ok(LoginOutcome::Ready(bb)) => bb.get_courses(true).await.is_ok(),
+            _ => false,
+        }
     }
 
     async fn get_course_table(&self, otp: Option<&str>) -> anyhow::Result<Value> {
@@ -326,8 +362,9 @@ fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "login",
             title: "登录教学网",
-            description: "用手机令牌 (OTP) 登录教学网, 一次性建立会话 (门户 + Blackboard)。\
-                          登录后本次运行内的查询无需再次输入 OTP, 直到会话过期。\
+            description: "用手机令牌 (OTP) 登录教学网。一个 OTP 只能登录一个服务: \
+                          门户(课表)优先登录; 若作业/成绩 (Blackboard) 未连接, \
+                          用一个新的 OTP 再调用一次即可。登录后本次运行内查询无需再输 OTP。\
                           OTP 必须由用户提供, 不要自行编造。",
             input_schema: json!({
                 "type": "object",

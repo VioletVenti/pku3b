@@ -35,7 +35,7 @@ cargo build --release --features mcp
 
 | Tool | Args | Returns |
 |------|------|---------|
-| `login` | `otp: string` (required) | Warms portal + Blackboard sessions once; `{portal, blackboard}` booleans. **Not read-only.** |
+| `login` | `otp: string` (required) | Warms **one** service per OTP (portal first; call again with a fresh OTP for Blackboard). Returns `{portal, blackboard}` booleans. **Not read-only.** |
 | `get_course_table` | `otp?: string` | Current-semester personal course table (from the portal). Reuses a warm session; `otp` only needed when cold. |
 | `list_assignments` | `include_finished?: bool` (default `false`), `otp?: string` | Assignments with deadlines, sorted by DDL; unfinished only by default. |
 | `get_grades` | `otp?: string` | Published grade items for current-semester courses. |
