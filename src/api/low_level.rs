@@ -161,36 +161,6 @@ pub fn extract_redirect_url(res: &cyper::Response) -> anyhow::Result<&str> {
     Ok(url)
 }
 
-/// Extracts a *client-side* redirect target from an HTML body, if present:
-/// a `location = '…'` / `window.location.href = "…"` assignment, a
-/// `location.replace("…")` / `.assign(…)` call, or a `<meta http-equiv=refresh>`.
-///
-/// Pure (no IO) so it is unit-tested directly. IAAA's OAuth authorize page
-/// sometimes hands back the SSO token via such a redirect rather than an HTTP
-/// 3xx (see [`LowLevelClient::iaaa_sso_login`]); this mirrors the inline
-/// `document.location` extraction already used by
-/// [`LowLevelClient::bb_course_content_file_uri`].
-pub fn extract_js_redirect(body: &str) -> Option<String> {
-    // `location[.href] = "url"`, optionally prefixed by window./document./top./self.
-    let assign = regex::Regex::new(
-        r#"(?:window\.|document\.|top\.|self\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']"#,
-    )
-    .unwrap();
-    // `location.replace("url")` / `location.assign("url")`
-    let call = regex::Regex::new(r#"location\.(?:replace|assign)\(\s*["']([^"']+)["']"#).unwrap();
-    // `<meta http-equiv="refresh" content="0; url=...">` (case-insensitive)
-    let meta = regex::Regex::new(
-        r#"(?i)<meta[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*content\s*=\s*["'][^"']*url=([^"'>]+)"#,
-    )
-    .unwrap();
-
-    assign
-        .captures(body)
-        .or_else(|| call.captures(body))
-        .map(|c| c[1].to_owned())
-        .or_else(|| meta.captures(body).map(|c| c[1].trim().to_owned()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,48 +182,6 @@ mod tests {
         let expected = "https://example.com/path/to/resource";
         let result = convert_uri(uri).unwrap();
         assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn js_redirect_window_location_with_token() {
-        // The warm-session SSO shape: IAAA bounces back to the service callback
-        // carrying the token via a client-side redirect.
-        let body = r#"<html><script>window.location.href = "https://course.pku.edu.cn/webapps/bb-sso-BBLEARN/execute/authValidate/campusLogin?_rand=0.5&token=ABC123";</script></html>"#;
-        let url = extract_js_redirect(body).expect("should find a redirect");
-        assert!(url.contains("token=ABC123"), "got: {url}");
-        assert!(url.starts_with("https://course.pku.edu.cn/"));
-    }
-
-    #[test]
-    fn js_redirect_bare_location_and_replace_and_meta() {
-        // Bare `location =` (no window. prefix).
-        assert_eq!(
-            extract_js_redirect("foo; location = '/next?token=t1'; bar").as_deref(),
-            Some("/next?token=t1")
-        );
-        // location.replace(...)
-        assert_eq!(
-            extract_js_redirect(r#"<script>location.replace("/go?token=t2")</script>"#).as_deref(),
-            Some("/go?token=t2")
-        );
-        // <meta http-equiv="refresh"> (case-insensitive, with a leading delay).
-        assert_eq!(
-            extract_js_redirect(
-                r#"<META HTTP-EQUIV="Refresh" CONTENT="0; url=https://h/cb?token=t3">"#
-            )
-            .as_deref(),
-            Some("https://h/cb?token=t3")
-        );
-    }
-
-    #[test]
-    fn js_redirect_none_on_login_page() {
-        // A cold IAAA login page has a form but no client-side redirect — the
-        // signal that SSO is unavailable and an OTP login is required.
-        let login_page = r#"<html><body><form action="/iaaa/oauthlogin.do" method="post">
-            <input id="user_name"/><input id="password" type="password"/>
-            <button>登录</button></form></body></html>"#;
-        assert_eq!(extract_js_redirect(login_page), None);
     }
 
     const HAR_PEM_PUBLIC_KEY: &str = r#"-----BEGIN PUBLIC KEY-----
