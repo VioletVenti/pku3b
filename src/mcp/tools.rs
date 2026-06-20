@@ -141,9 +141,11 @@ impl ToolRegistry {
     async fn login(&self, otp: Option<&str>) -> anyhow::Result<Value> {
         let cfg = self.cfg().await?;
 
-        // Cheap, OTP-free reuse checks (plain GETs, no credential POST).
+        // Reuse checks: portal is a plain data GET; Blackboard is verified by
+        // listing courses — NOT a bb_homepage preflight, which 200s on an
+        // unauthenticated guest page and would falsely report "connected".
         let portal_warm = self.portal_warm().await;
-        let mut blackboard_ok = self.blackboard_warm().await;
+        let mut blackboard_ok = self.blackboard_courses_ok(&cfg).await;
         log::info!("[mcp] login: portal_warm={portal_warm} blackboard_warm={blackboard_ok}");
 
         // Already fully connected -> no OTP needed.
@@ -170,12 +172,13 @@ impl ToolRegistry {
         }
 
         if !blackboard_ok {
-            // Trusted device -> Blackboard logs in with an EMPTY OTP (no second
-            // prompt). This is the whole point of remTrustChk.
+            // Trusted device (from the portal login's remTrustChk) -> Blackboard
+            // should log in with an EMPTY OTP. try_blackboard FORCES the login
+            // (bypassing the unreliable bb_homepage preflight) and verifies.
             blackboard_ok = self.try_blackboard(&cfg, None).await;
             log::info!("[mcp] login: blackboard via trusted device (no OTP) = {blackboard_ok}");
-            // If trust didn't carry AND the OTP is still unused (portal was
-            // already warm), spend the fresh OTP directly on Blackboard.
+            // Trust didn't carry AND the OTP is still unused (portal was already
+            // warm) -> spend the fresh OTP directly on Blackboard.
             if !blackboard_ok && portal_warm {
                 blackboard_ok = self.try_blackboard(&cfg, Some(otp)).await;
             }
@@ -196,18 +199,28 @@ impl ToolRegistry {
         ))
     }
 
-    /// True if the Blackboard session is usable right now (reuses cookies, no
-    /// login attempt). `bb_homepage` bails when redirected to the login page, so
-    /// `Ok` means authorized. Used to skip OTP entirely when already connected
-    /// and to avoid a doomed empty-OTP login attempt on a cold start.
-    async fn blackboard_warm(&self) -> bool {
-        match self.client.bb_homepage().await {
-            Ok(_) => {
-                log::info!("[mcp] blackboard_warm: HIT (reused session)");
-                true
-            }
-            Err(e) => {
-                log::info!("[mcp] blackboard_warm: MISS ({e:#})");
+    /// True if Blackboard is usable right now — verified by actually listing
+    /// courses off the current session. This is the real auth signal: a bare
+    /// `bb_homepage` GET 200s on an unauthenticated guest page (false positive),
+    /// while `get_courses` fails unless genuinely logged in. Does not force a
+    /// login, so it doubles as the OTP-free reuse check.
+    async fn blackboard_courses_ok(&self, cfg: &config::Config) -> bool {
+        match auth::login_blackboard(&self.client, cfg, None).await {
+            Ok(LoginOutcome::Ready(bb)) => match bb.get_courses(true).await {
+                Ok(courses) => {
+                    log::info!(
+                        "[mcp] blackboard verify: get_courses OK ({})",
+                        courses.len()
+                    );
+                    true
+                }
+                Err(e) => {
+                    log::info!("[mcp] blackboard verify: get_courses ERR: {e:#}");
+                    false
+                }
+            },
+            _ => {
+                log::info!("[mcp] blackboard verify: not authorized (needs login)");
                 false
             }
         }
@@ -239,53 +252,36 @@ impl ToolRegistry {
         }
     }
 
-    /// Try to establish/confirm a Blackboard session; verify by listing courses
-    /// (guards the cold-preflight false positive). Returns whether it's usable.
+    /// Force a fresh Blackboard IAAA login, then verify by listing courses.
+    ///
+    /// We must NOT go through `Client::blackboard` for the login: its
+    /// `bb_homepage` preflight returns Ok on an unauthenticated course.pku.edu.cn
+    /// guest page, which silently skips `bb_login`. So we call `bb_login`
+    /// directly. `otp = None` sends an EMPTY OTP — relying on a trusted device
+    /// (the portal login's `remTrustChk`); `otp = Some(..)` spends a fresh OTP.
     async fn try_blackboard(&self, cfg: &config::Config, otp: Option<&str>) -> bool {
-        // With an OTP, force a fresh Blackboard IAAA login. We must not go through
-        // Client::blackboard here: its `bb_homepage` preflight can return Ok on
-        // course.pku.edu.cn even when unauthenticated, which skips the login and
-        // silently wastes the OTP (the bug behind blackboard never connecting).
-        if let Some(otp) = otp {
-            match self
-                .client
-                .bb_login(&cfg.username, &cfg.password, otp)
-                .await
-            {
-                Ok(()) => {
-                    log::info!("[mcp] try_blackboard: bb_login OK");
-                    self.save_session().await;
-                }
-                Err(e) => {
-                    log::info!("[mcp] try_blackboard: bb_login ERR: {e:#}");
-                    return false;
-                }
+        match self
+            .client
+            .bb_login(&cfg.username, &cfg.password, otp.unwrap_or(""))
+            .await
+        {
+            Ok(()) => {
+                log::info!(
+                    "[mcp] try_blackboard: bb_login OK (with_otp={})",
+                    otp.is_some()
+                );
+                self.save_session().await;
+            }
+            Err(e) => {
+                log::info!(
+                    "[mcp] try_blackboard: bb_login ERR (with_otp={}): {e:#}",
+                    otp.is_some()
+                );
+                return false;
             }
         }
         // Verify the session actually works by listing courses.
-        match auth::login_blackboard(&self.client, cfg, None).await {
-            Ok(LoginOutcome::Ready(bb)) => match bb.get_courses(true).await {
-                Ok(courses) => {
-                    log::info!(
-                        "[mcp] try_blackboard: get_courses OK ({} courses)",
-                        courses.len()
-                    );
-                    true
-                }
-                Err(e) => {
-                    log::info!("[mcp] try_blackboard: get_courses ERR: {e:#}");
-                    false
-                }
-            },
-            Ok(LoginOutcome::NeedsOtp { .. }) => {
-                log::info!("[mcp] try_blackboard: still needs OTP after login");
-                false
-            }
-            Err(e) => {
-                log::info!("[mcp] try_blackboard: verify ERR: {e:#}");
-                false
-            }
-        }
+        self.blackboard_courses_ok(cfg).await
     }
 
     async fn get_course_table(&self, otp: Option<&str>) -> anyhow::Result<Value> {
