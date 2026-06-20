@@ -134,31 +134,33 @@ impl ToolRegistry {
 
     // ---- tool implementations (the hidden depth) --------------------------
 
-    /// One-time login: warm the teaching-network session with an OTP, then
-    /// persist. A single IAAA OTP authenticates **one** service, so we only
-    /// spend it on a service that isn't already warm — call this again with a
-    /// fresh OTP to connect the other. After warming, the long-lived process
-    /// reuses the session (no per-call OTP).
+    /// One-time login: connect the teaching-network session. Tries Blackboard
+    /// via IAAA SSO first (no OTP — works when the IAAA session is warm); then,
+    /// if an OTP is supplied, logs into whatever is still cold. After warming,
+    /// the long-lived process reuses the session (no per-call OTP).
     async fn login(&self, otp: Option<&str>) -> anyhow::Result<Value> {
         let cfg = self.cfg().await?;
 
         // Portal warmth is a cheap GET (no login, no OTP spent).
         let portal_warm = self.portal_warm().await;
+        // Try Blackboard via IAAA SSO first — no OTP, works if the IAAA session
+        // is warm (e.g. persisted from a prior login). A GET, no credential POST.
+        let mut blackboard_ok = self.try_blackboard_sso(&cfg).await;
+        log::info!("[mcp] login: portal_warm={portal_warm} sso_blackboard={blackboard_ok}");
+
+        // Already fully connected (e.g. both sessions warm) — no OTP needed.
+        if portal_warm && blackboard_ok {
+            return Ok(ok(json!({ "portal": true, "blackboard": true })));
+        }
 
         let Some(otp) = otp else {
-            log::info!("[mcp] login: no OTP provided -> needs_otp");
-            return Ok(needs_otp(None)); // UI must collect an OTP first
+            log::info!("[mcp] login: not fully connected and no OTP -> needs_otp");
+            return Ok(needs_otp(None));
         };
-        log::info!(
-            "[mcp] login: portal_warm={portal_warm} -> spend OTP on {}",
-            if portal_warm { "blackboard" } else { "portal" }
-        );
 
         let mut portal_ok = portal_warm;
-        let blackboard_ok;
-
         if !portal_warm {
-            // First OTP -> portal (the primary target; this consumes the OTP).
+            // Spend the OTP on the portal (the primary target).
             portal_ok = matches!(
                 auth::login_portal(&self.client, &cfg, Some(otp)).await,
                 Ok(LoginOutcome::Ready(_))
@@ -166,17 +168,16 @@ impl ToolRegistry {
             log::info!("[mcp] login: portal login result={portal_ok}");
             if portal_ok {
                 self.save_session().await;
+                // IAAA session is now warm — retry Blackboard via SSO (still no
+                // second OTP).
+                if !blackboard_ok {
+                    blackboard_ok = self.try_blackboard_sso(&cfg).await;
+                }
             }
-            // Best-effort: IAAA *might* carry the session to Blackboard with no
-            // second OTP. One attempt with an empty OTP; if it fails the user
-            // re-logs in with a fresh OTP and the `else` branch warms Blackboard.
-            blackboard_ok = self.try_blackboard(&cfg, None).await;
-        } else {
-            // Portal already connected -> spend this (fresh) OTP on Blackboard.
+        } else if !blackboard_ok {
+            // Portal already connected and SSO didn't carry Blackboard -> spend
+            // this (fresh) OTP on Blackboard directly.
             blackboard_ok = self.try_blackboard(&cfg, Some(otp)).await;
-        }
-        if blackboard_ok {
-            self.save_session().await;
         }
         log::info!("[mcp] login: result portal={portal_ok} blackboard={blackboard_ok}");
 
@@ -189,6 +190,41 @@ impl ToolRegistry {
         Ok(ok(
             json!({ "portal": portal_ok, "blackboard": blackboard_ok }),
         ))
+    }
+
+    /// Connect Blackboard via IAAA SSO (no second OTP), then verify by listing
+    /// courses. Returns `false` when SSO is unavailable (cold IAAA session) or
+    /// the verify fails, so the caller can decide whether to spend an OTP.
+    async fn try_blackboard_sso(&self, cfg: &config::Config) -> bool {
+        match self.client.bb_sso_login().await {
+            Ok(()) => {
+                log::info!("[mcp] try_blackboard_sso: bb_sso_login OK");
+                self.save_session().await;
+            }
+            Err(e) => {
+                log::info!("[mcp] try_blackboard_sso: bb_sso_login ERR: {e:#}");
+                return false;
+            }
+        }
+        match auth::login_blackboard(&self.client, cfg, None).await {
+            Ok(LoginOutcome::Ready(bb)) => match bb.get_courses(true).await {
+                Ok(courses) => {
+                    log::info!(
+                        "[mcp] try_blackboard_sso: get_courses OK ({} courses)",
+                        courses.len()
+                    );
+                    true
+                }
+                Err(e) => {
+                    log::info!("[mcp] try_blackboard_sso: get_courses ERR: {e:#}");
+                    false
+                }
+            },
+            _ => {
+                log::info!("[mcp] try_blackboard_sso: verify not ready");
+                false
+            }
+        }
     }
 
     /// True if the portal session is usable right now (reuses cookies, no login).

@@ -82,6 +82,14 @@ impl LowLevelClient {
         Ok(())
     }
 
+    /// Establish a Blackboard session via IAAA single sign-on (no OTP), relying
+    /// on a warm IAAA session from a prior login. Returns `Err` (so the caller
+    /// can fall back to an OTP login) when the IAAA session is cold.
+    pub async fn bb_sso_login(&self) -> anyhow::Result<()> {
+        self.iaaa_sso_login("blackboard", "教学网", OAUTH_REDIR)
+            .await
+    }
+
     /// 获取教学网主页内容 ([`BB_HOME`]), 返回 HTML 文档
     pub async fn bb_homepage(&self) -> anyhow::Result<Html> {
         let res = self
