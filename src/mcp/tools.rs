@@ -146,8 +146,13 @@ impl ToolRegistry {
         let portal_warm = self.portal_warm().await;
 
         let Some(otp) = otp else {
+            log::info!("[mcp] login: no OTP provided -> needs_otp");
             return Ok(needs_otp(None)); // UI must collect an OTP first
         };
+        log::info!(
+            "[mcp] login: portal_warm={portal_warm} -> spend OTP on {}",
+            if portal_warm { "blackboard" } else { "portal" }
+        );
 
         let mut portal_ok = portal_warm;
         let blackboard_ok;
@@ -158,6 +163,7 @@ impl ToolRegistry {
                 auth::login_portal(&self.client, &cfg, Some(otp)).await,
                 Ok(LoginOutcome::Ready(_))
             );
+            log::info!("[mcp] login: portal login result={portal_ok}");
             if portal_ok {
                 self.save_session().await;
             }
@@ -172,6 +178,7 @@ impl ToolRegistry {
         if blackboard_ok {
             self.save_session().await;
         }
+        log::info!("[mcp] login: result portal={portal_ok} blackboard={blackboard_ok}");
 
         if !portal_ok && !blackboard_ok {
             return Ok(json!({
@@ -186,21 +193,76 @@ impl ToolRegistry {
 
     /// True if the portal session is usable right now (reuses cookies, no login).
     async fn portal_warm(&self) -> bool {
-        if let Ok(raw) = self.client.portal_my_course_table_get("", "").await
-            && let Ok(v) = serde_json::from_str::<Value>(&raw)
-            && (v.get("course").is_some() || v.get("nowXnxq").is_some())
-        {
-            return true;
+        match self.client.portal_my_course_table_get("", "").await {
+            Ok(raw) => {
+                let parsed = serde_json::from_str::<Value>(&raw).ok();
+                let warm = parsed
+                    .as_ref()
+                    .is_some_and(|v| v.get("course").is_some() || v.get("nowXnxq").is_some());
+                if warm {
+                    log::info!("[mcp] portal_warm: HIT (reused session)");
+                } else {
+                    let snip: String = raw.chars().take(120).collect();
+                    log::info!(
+                        "[mcp] portal_warm: MISS (len={}, snippet={snip:?})",
+                        raw.len()
+                    );
+                }
+                warm
+            }
+            Err(e) => {
+                log::info!("[mcp] portal_warm: MISS (request error: {e:#})");
+                false
+            }
         }
-        false
     }
 
     /// Try to establish/confirm a Blackboard session; verify by listing courses
     /// (guards the cold-preflight false positive). Returns whether it's usable.
     async fn try_blackboard(&self, cfg: &config::Config, otp: Option<&str>) -> bool {
-        match auth::login_blackboard(&self.client, cfg, otp).await {
-            Ok(LoginOutcome::Ready(bb)) => bb.get_courses(true).await.is_ok(),
-            _ => false,
+        // With an OTP, force a fresh Blackboard IAAA login. We must not go through
+        // Client::blackboard here: its `bb_homepage` preflight can return Ok on
+        // course.pku.edu.cn even when unauthenticated, which skips the login and
+        // silently wastes the OTP (the bug behind blackboard never connecting).
+        if let Some(otp) = otp {
+            match self
+                .client
+                .bb_login(&cfg.username, &cfg.password, otp)
+                .await
+            {
+                Ok(()) => {
+                    log::info!("[mcp] try_blackboard: bb_login OK");
+                    self.save_session().await;
+                }
+                Err(e) => {
+                    log::info!("[mcp] try_blackboard: bb_login ERR: {e:#}");
+                    return false;
+                }
+            }
+        }
+        // Verify the session actually works by listing courses.
+        match auth::login_blackboard(&self.client, cfg, None).await {
+            Ok(LoginOutcome::Ready(bb)) => match bb.get_courses(true).await {
+                Ok(courses) => {
+                    log::info!(
+                        "[mcp] try_blackboard: get_courses OK ({} courses)",
+                        courses.len()
+                    );
+                    true
+                }
+                Err(e) => {
+                    log::info!("[mcp] try_blackboard: get_courses ERR: {e:#}");
+                    false
+                }
+            },
+            Ok(LoginOutcome::NeedsOtp { .. }) => {
+                log::info!("[mcp] try_blackboard: still needs OTP after login");
+                false
+            }
+            Err(e) => {
+                log::info!("[mcp] try_blackboard: verify ERR: {e:#}");
+                false
+            }
         }
     }
 
