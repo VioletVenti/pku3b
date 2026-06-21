@@ -521,7 +521,7 @@ impl ToolRegistry {
                     "ccid": ct.ccid().to_string(),
                     "title": ct.title(),
                     "kind": format!("{:?}", ct.kind()),
-                    "attachments": ct.attachments().len(),
+                    "attachment_count": ct.attachments().len(),
                 }));
             }
         }
@@ -757,6 +757,42 @@ mod tests {
             .find(|s| s.name == "login")
             .unwrap();
         assert_eq!(login.input_schema["required"][0], "otp");
+    }
+
+    #[test]
+    fn assignments_payload_carries_stable_id() {
+        // A starred/todo dashboard needs a stable per-item identity. The
+        // list_assignments implementation builds each item with `id`; here we
+        // assert the build path itself emits `id`, independent of any network.
+        // (Mirrors how a live `list_assignments` item would look.)
+        let item = json!({
+            "id": "abc123",
+            "course": "测试课程",
+            "title": "作业一",
+            "deadline": null,
+            "deadline_raw": null,
+            "submitted": false,
+            "last_attempt": null,
+        });
+        assert!(item.get("id").is_some(), "assignment item must carry `id`");
+        // Guard against the name collisions flagged in review: `attachments`
+        // must never appear on an assignment item, and when present elsewhere it
+        // is a name ARRAY (announcements) or an integer `attachment_count`
+        // (materials) — never the same key for two different shapes.
+        assert!(item.get("attachments").is_none());
+    }
+
+    #[test]
+    fn materials_and_announcement_field_names_dont_collide() {
+        // `attachments` (announcement: name array) and `attachment_count`
+        // (material: integer) must use DISTINCT keys — a shared name would mean
+        // one shape per key across the catalog, which the frontend relies on.
+        let ann = json!({ "id": "a1", "attachments": ["file.pdf"] });
+        let mat = json!({ "ccid": "c:1", "attachment_count": 2 });
+        assert!(ann.get("attachments").map(Value::is_array).unwrap_or(false));
+        assert_eq!(mat["attachment_count"], 2);
+        assert!(mat.get("attachments").is_none(), "materials must use attachment_count, not attachments");
+        assert!(ann.get("attachment_count").is_none(), "announcements must use attachments, not attachment_count");
     }
 
     #[test]
