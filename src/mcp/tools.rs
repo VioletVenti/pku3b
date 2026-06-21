@@ -520,7 +520,7 @@ impl ToolRegistry {
                     "course": course_name,
                     "ccid": ct.ccid().to_string(),
                     "title": ct.title(),
-                    "kind": format!("{:?}", ct.kind()),
+                    "kind": kind_label(ct.kind()),
                     "attachment_count": ct.attachments().len(),
                 }));
             }
@@ -596,6 +596,25 @@ fn otp_optional_schema(extra: Value) -> Value {
         }
     }
     json!({ "type": "object", "properties": props, "additionalProperties": false })
+}
+
+/// Map a [`CourseContentKind`] to a stable Chinese label for display. The enum
+/// is derived (in `api::blackboard`) from the coursepage `<img alt>` text
+/// (作业/音频/内容文件夹/项目/文件/测试), so this is a faithful localization —
+/// never a Rust `Debug` name on the wire (which leaked English like `[Document]`
+/// into the UI).
+fn kind_label(kind: &api::blackboard::CourseContentKind) -> &'static str {
+    use api::blackboard::CourseContentKind as K;
+    match kind {
+        K::Document => "文档",
+        K::File => "文件",
+        K::Assignment => "作业",
+        K::Announcement => "公告",
+        K::Audio => "音频",
+        K::Folder => "文件夹",
+        K::Quiz => "测试",
+        K::Unknown => "其它",
+    }
 }
 
 /// The static tool catalog. Free function so it is testable without building a
@@ -803,5 +822,30 @@ mod tests {
         assert_eq!(n["status"], "needs_otp");
         assert_eq!(n["mobile_mask"], "135****1234");
         assert!(n["hint"].as_str().unwrap().contains("OTP"));
+    }
+
+    #[test]
+    fn kind_label_is_chinese_and_exhaustive() {
+        use crate::api::blackboard::CourseContentKind as K;
+        // Every variant maps to a non-English Chinese label (no Rust Debug names
+        // leak onto the wire). Unknown → 其它, not "Unknown".
+        let labels: std::collections::HashSet<&str> = [
+            kind_label(&K::Document),
+            kind_label(&K::File),
+            kind_label(&K::Assignment),
+            kind_label(&K::Announcement),
+            kind_label(&K::Audio),
+            kind_label(&K::Folder),
+            kind_label(&K::Quiz),
+            kind_label(&K::Unknown),
+        ]
+        .into_iter()
+        .collect();
+        for l in &labels {
+            assert!(l.is_char_boundary(0), "label not empty/ascii-code: {l}");
+            assert!(!l.chars().any(|c| c.is_ascii_alphabetic()), "English leaked: {l}");
+        }
+        assert!(labels.contains("其它"));
+        assert!(labels.contains("文档") && labels.contains("文件") && labels.contains("文件夹"));
     }
 }
