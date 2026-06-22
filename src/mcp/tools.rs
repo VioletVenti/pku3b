@@ -552,10 +552,7 @@ impl ToolRegistry {
         for handle in handles {
             let course = handle.get().await.context("获取课程")?;
             let course_name = course.meta().name().to_owned();
-            let videos = course
-                .get_video_list()
-                .await
-                .context("获取课程回放列表")?;
+            let videos = course.get_video_list().await.context("获取课程回放列表")?;
             for v in videos {
                 let m = v.meta();
                 items.push(json!({
@@ -810,8 +807,14 @@ mod tests {
         let mat = json!({ "ccid": "c:1", "attachment_count": 2 });
         assert!(ann.get("attachments").map(Value::is_array).unwrap_or(false));
         assert_eq!(mat["attachment_count"], 2);
-        assert!(mat.get("attachments").is_none(), "materials must use attachment_count, not attachments");
-        assert!(ann.get("attachment_count").is_none(), "announcements must use attachments, not attachment_count");
+        assert!(
+            mat.get("attachments").is_none(),
+            "materials must use attachment_count, not attachments"
+        );
+        assert!(
+            ann.get("attachment_count").is_none(),
+            "announcements must use attachments, not attachment_count"
+        );
     }
 
     #[test]
@@ -843,7 +846,10 @@ mod tests {
         .collect();
         for l in &labels {
             assert!(l.is_char_boundary(0), "label not empty/ascii-code: {l}");
-            assert!(!l.chars().any(|c| c.is_ascii_alphabetic()), "English leaked: {l}");
+            assert!(
+                !l.chars().any(|c| c.is_ascii_alphabetic()),
+                "English leaked: {l}"
+            );
         }
         assert!(labels.contains("其它"));
         assert!(labels.contains("文档") && labels.contains("文件") && labels.contains("文件夹"));
