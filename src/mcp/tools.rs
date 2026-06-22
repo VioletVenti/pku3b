@@ -7,9 +7,13 @@
 //!
 //! The interface is small — [`tool_specs`] + [`ToolRegistry::call`] — while the
 //! implementation hides all of pku3b's `api::*` orchestration (build client, log
-//! in, crawl, serialize). All data tools are read-only; the one side-effecting
-//! API method (`CourseAssignment::submit_file`) is deliberately not exposed.
-//! `login` is the only non-read-only tool (it establishes a session).
+//! in, crawl, serialize). The data tools are read-only; `submit_assignment` is the
+//! one side-effecting data tool (it wraps `CourseAssignment::submit_file`) and is
+//! `read_only: false`. It is the **execution primitive** the backend's permission
+//! gate dispatches to via a direct `tools/call` — it is NOT exposed to the LLM
+//! agent (the backend filters it out of the agent's toolset and offers a
+//! `file_id`-based proxy instead, so the model never handles a server-local path).
+//! `login` is the other non-read-only tool (it establishes a session).
 //!
 //! ## Sessions / OTP
 //! The HTTP client (and its cookie jar) lives for the whole `pku3b mcp` process,
@@ -130,6 +134,11 @@ impl ToolRegistry {
             "get_announcements" => self.get_announcements(otp).await,
             "list_course_materials" => self.list_course_materials(otp).await,
             "list_videos" => self.list_videos(otp).await,
+            "submit_assignment" => {
+                let assignment_id = args.get("assignment_id").and_then(Value::as_str);
+                let file_path = args.get("file_path").and_then(Value::as_str);
+                self.submit_assignment(assignment_id, file_path, otp).await
+            }
             other => return Err(ToolError::UnknownTool(other.to_string())),
         };
         result.map_err(|e| ToolError::Internal(format!("{e:#}")))
@@ -335,24 +344,14 @@ impl ToolRegistry {
             let course = handle.get().await.context("获取课程")?;
             let course_name = course.meta().name().to_owned();
 
-            // Drain the lazy content stream, then keep only assignments.
-            let mut stream = course.content_stream();
-            let mut contents = Vec::new();
-            while let Some(batch) = stream.next_batch().await {
-                contents.extend(batch);
-            }
-
-            for data in contents {
-                let Some(handle) = course.build_content(data).into_assignment_opt() else {
-                    continue;
-                };
-                let assignment = handle.get().await.context("获取作业详情")?;
+            for ah in Self::course_assignment_handles(&course).await {
+                let assignment = ah.get().await.context("获取作业详情")?;
                 let submitted = assignment.last_attempt().is_some();
                 if !include_finished && submitted {
                     continue;
                 }
                 items.push(json!({
-                    "id": handle.id(),
+                    "id": ah.id(),
                     "course": course_name,
                     "title": assignment.title(),
                     "deadline": assignment.deadline().map(|d| d.to_rfc3339()),
@@ -377,6 +376,101 @@ impl ToolRegistry {
         Ok(ok(
             json!({ "include_finished": include_finished, "assignments": items }),
         ))
+    }
+
+    /// Drain one course's content stream and return its assignment handles. Shared
+    /// by [`Self::list_assignments`] (read) and [`Self::submit_assignment`] (write)
+    /// so the stable `CourseAssignmentHandle::id()` hash is computed over the
+    /// identical path in both — a divergence here would make an id returned by
+    /// `list_assignments` fail to resolve at submit time.
+    async fn course_assignment_handles(
+        course: &api::blackboard::Course,
+    ) -> Vec<api::blackboard::CourseAssignmentHandle> {
+        let mut stream = course.content_stream();
+        let mut contents = Vec::new();
+        while let Some(batch) = stream.next_batch().await {
+            contents.extend(batch);
+        }
+        let mut out = Vec::new();
+        for data in contents {
+            if let Some(ah) = course.build_content(data).into_assignment_opt() {
+                out.push(ah);
+            }
+        }
+        out
+    }
+
+    /// Submit a local file as the attempt for one assignment (side-effecting
+    /// write). `assignment_id` is the stable hash from [`Self::list_assignments`];
+    /// because the hash is not decodable back to `(course_id, content_id)`, we
+    /// re-walk the content tree and match by id — the same path
+    /// [`Self::list_assignments`] uses via [`Self::course_assignment_handles`].
+    /// `file_path` must be a path the MCP server process can read. This is the
+    /// execution primitive the backend's permission gate dispatches to directly;
+    /// it is NOT exposed to the LLM agent (filtered out of the agent toolset).
+    async fn submit_assignment(
+        &self,
+        assignment_id: Option<&str>,
+        file_path: Option<&str>,
+        otp: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        let (Some(assignment_id), Some(file_path)) = (assignment_id, file_path) else {
+            return Ok(json!({
+                "status": "error",
+                "message": "submit_assignment 需要 assignment_id 与 file_path 参数。"
+            }));
+        };
+        let path = std::path::Path::new(file_path);
+        if !path.is_file() {
+            return Ok(json!({
+                "status": "error",
+                "message": format!("提交文件不存在或不可读: {file_path}")
+            }));
+        }
+
+        let cfg = self.cfg().await?;
+        let bb = match auth::login_blackboard(&self.client, &cfg, otp).await? {
+            LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
+            LoginOutcome::Ready(b) => b,
+        };
+        self.save_session().await;
+
+        let handles = match bb.get_courses(true).await {
+            Ok(h) => h,
+            Err(e) => {
+                log::warn!("获取课程列表失败: {e:#}");
+                return Ok(needs_otp(None));
+            }
+        };
+
+        for ch in handles {
+            let course = match ch.get().await {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!("获取课程失败, 跳过: {e:#}");
+                    continue;
+                }
+            };
+            for ah in Self::course_assignment_handles(&course).await {
+                if ah.id() != assignment_id {
+                    continue;
+                }
+                let assignment = ah.get().await.context("获取作业详情")?;
+                assignment.submit_file(path).await.context("提交作业文件")?;
+                log::info!("[mcp] submit_assignment: submitted {assignment_id}");
+                return Ok(ok(json!({
+                    "assignment_id": assignment_id,
+                    "submitted": true,
+                })));
+            }
+        }
+
+        Ok(json!({
+            "status": "error",
+            "message": format!(
+                "未找到 id 为 {assignment_id} 的作业; 它可能已截止、已被移除或不在当前课程列表中。"
+            )
+        }))
     }
 
     async fn get_grades(&self, otp: Option<&str>) -> anyhow::Result<Value> {
@@ -654,6 +748,25 @@ fn tool_specs() -> Vec<ToolSpec> {
             read_only: true,
         },
         ToolSpec {
+            name: "submit_assignment",
+            title: "交作业",
+            description: "将一个本地文件作为某次作业的作答提交到教学网 (有副作用)。\
+                          需要 assignment_id (list_assignments 返回的稳定 id) 与 file_path \
+                          (MCP server 进程可读的本地文件绝对路径)。该工具是后端权限闸的执行原语, \
+                          不对 LLM agent 暴露 (后端过滤后以 file_id 代理工具提供给 agent)。",
+            input_schema: otp_optional_schema(json!({
+                "assignment_id": {
+                    "type": "string",
+                    "description": "目标作业的稳定 id (list_assignments 返回的 id 字段)。"
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "待提交文件的本地绝对路径 (MCP server 进程可读)。"
+                }
+            })),
+            read_only: false,
+        },
+        ToolSpec {
             name: "get_grades",
             title: "成绩查询",
             description: "查询当前学期各门课程已公布的成绩条目 (作业/总评等)。",
@@ -705,7 +818,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_named_and_login_is_only_non_read_only() {
+    fn catalog_names_and_read_only_flags_are_correct() {
         let specs = tool_specs();
         let names: Vec<_> = specs.iter().map(|s| s.name).collect();
         assert!(names.contains(&"login"));
@@ -715,17 +828,34 @@ mod tests {
         assert!(names.contains(&"get_announcements"));
         assert!(names.contains(&"list_course_materials"));
         assert!(names.contains(&"list_videos"));
-        // Data tools are read-only; `login` is the only stateful one.
+        assert!(names.contains(&"submit_assignment"));
+        // `login` and `submit_assignment` are the non-read-only tools; every other
+        // tool is read-only. submit_assignment is the side-effecting execution
+        // primitive (hidden from the agent on the consumer side, not here).
         for s in &specs {
             assert_eq!(
                 s.read_only,
-                s.name != "login",
+                !(s.name == "login" || s.name == "submit_assignment"),
                 "read_only wrong for {}",
                 s.name
             );
         }
-        // No write/side-effecting data tool is exposed.
-        assert!(!names.contains(&"submit_assignment"));
+    }
+
+    #[test]
+    fn submit_assignment_schema_has_id_and_path() {
+        let s = tool_specs()
+            .into_iter()
+            .find(|s| s.name == "submit_assignment")
+            .unwrap();
+        assert!(!s.read_only, "submit_assignment must be read_only: false");
+        let schema = &s.input_schema;
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema["properties"]["assignment_id"].is_object());
+        assert!(schema["properties"]["file_path"].is_object());
+        // It still carries the shared otp property like the other tools.
+        assert!(schema["properties"]["otp"].is_object());
     }
 
     #[test]
