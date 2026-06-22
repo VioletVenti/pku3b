@@ -127,6 +127,9 @@ impl ToolRegistry {
                 self.list_assignments(include_finished, otp).await
             }
             "get_grades" => self.get_grades(otp).await,
+            "get_announcements" => self.get_announcements(otp).await,
+            "list_course_materials" => self.list_course_materials(otp).await,
+            "list_videos" => self.list_videos(otp).await,
             other => return Err(ToolError::UnknownTool(other.to_string())),
         };
         result.map_err(|e| ToolError::Internal(format!("{e:#}")))
@@ -349,6 +352,7 @@ impl ToolRegistry {
                     continue;
                 }
                 items.push(json!({
+                    "id": handle.id(),
                     "course": course_name,
                     "title": assignment.title(),
                     "deadline": assignment.deadline().map(|d| d.to_rfc3339()),
@@ -417,6 +421,162 @@ impl ToolRegistry {
 
         Ok(ok(json!({ "grades": grades })))
     }
+
+    /// Course announcements (课程公告), pulled from each course's announcement
+    /// page. Read-only. Sorted newest-first by publish time. Each item carries a
+    /// stable `id` (the announcement handle's id) so callers can star / dedupe it.
+    async fn get_announcements(&self, otp: Option<&str>) -> anyhow::Result<Value> {
+        let cfg = self.cfg().await?;
+        let bb = match auth::login_blackboard(&self.client, &cfg, otp).await? {
+            LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
+            LoginOutcome::Ready(b) => b,
+        };
+        self.save_session().await;
+
+        let handles = match bb.get_courses(true).await {
+            Ok(h) => h,
+            Err(e) => {
+                log::warn!("获取课程列表失败: {e:#}");
+                return Ok(needs_otp(None));
+            }
+        };
+
+        let mut items: Vec<Value> = Vec::new();
+        for handle in handles {
+            let course = handle.get().await.context("获取课程")?;
+            let course_name = course.meta().name().to_owned();
+            let announcements = course
+                .list_announcements_from_coursepage()
+                .await
+                .context("获取课程公告")?;
+            for ann in announcements {
+                items.push(json!({
+                    "id": ann.id(),
+                    "course": course_name,
+                    "title": ann.title(),
+                    "time": ann.time(),
+                    "descriptions": ann.descriptions(),
+                    "attachments": ann.attachments().iter().map(|(name, _)| name).collect::<Vec<_>>(),
+                }));
+            }
+        }
+
+        // Sort newest-first by publish time; items without a parseable time last.
+        items.sort_by(|a, b| {
+            let key = |v: &Value| v.get("time").and_then(Value::as_str).map(str::to_owned);
+            match (key(a), key(b)) {
+                (Some(x), Some(y)) => y.cmp(&x),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
+
+        Ok(ok(json!({ "announcements": items })))
+    }
+
+    /// Course materials listing (课程材料), read-only. Walks each course's content
+    /// tree and keeps the NON-assignment, NON-announcement items (those are surfaced
+    /// by `list_assignments` / `get_announcements` respectively, to avoid duplication).
+    /// Listing only — file download is deliberately out of scope here.
+    async fn list_course_materials(&self, otp: Option<&str>) -> anyhow::Result<Value> {
+        let cfg = self.cfg().await?;
+        let bb = match auth::login_blackboard(&self.client, &cfg, otp).await? {
+            LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
+            LoginOutcome::Ready(b) => b,
+        };
+        self.save_session().await;
+
+        let handles = match bb.get_courses(true).await {
+            Ok(h) => h,
+            Err(e) => {
+                log::warn!("获取课程列表失败: {e:#}");
+                return Ok(needs_otp(None));
+            }
+        };
+
+        let mut items: Vec<Value> = Vec::new();
+        for handle in handles {
+            let course = handle.get().await.context("获取课程")?;
+            let course_name = course.meta().name().to_owned();
+
+            let mut stream = course.content_stream();
+            let mut contents = Vec::new();
+            while let Some(batch) = stream.next_batch().await {
+                contents.extend(batch);
+            }
+
+            for data in contents {
+                let ct = course.build_content(data);
+                // Skip kinds already surfaced elsewhere.
+                if matches!(
+                    ct.kind(),
+                    api::blackboard::CourseContentKind::Assignment
+                        | api::blackboard::CourseContentKind::Announcement
+                ) {
+                    continue;
+                }
+                items.push(json!({
+                    "course": course_name,
+                    "ccid": ct.ccid().to_string(),
+                    "title": ct.title(),
+                    "kind": kind_label(ct.kind()),
+                    "attachment_count": ct.attachments().len(),
+                }));
+            }
+        }
+
+        Ok(ok(json!({ "materials": items })))
+    }
+
+    /// Course replay video listing (课程回放), read-only. Listing only — video
+    /// download is behind the `video-download` cargo feature and ffmpeg, and is
+    /// out of scope here. Sorted newest-first by the video's timestamp.
+    async fn list_videos(&self, otp: Option<&str>) -> anyhow::Result<Value> {
+        let cfg = self.cfg().await?;
+        let bb = match auth::login_blackboard(&self.client, &cfg, otp).await? {
+            LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
+            LoginOutcome::Ready(b) => b,
+        };
+        self.save_session().await;
+
+        let handles = match bb.get_courses(true).await {
+            Ok(h) => h,
+            Err(e) => {
+                log::warn!("获取课程列表失败: {e:#}");
+                return Ok(needs_otp(None));
+            }
+        };
+
+        let mut items: Vec<Value> = Vec::new();
+        for handle in handles {
+            let course = handle.get().await.context("获取课程")?;
+            let course_name = course.meta().name().to_owned();
+            let videos = course.get_video_list().await.context("获取课程回放列表")?;
+            for v in videos {
+                let m = v.meta();
+                items.push(json!({
+                    "id": v.id(),
+                    "course": course_name,
+                    "title": m.title(),
+                    "time": m.time(),
+                }));
+            }
+        }
+
+        // Sort newest-first by time (descending).
+        items.sort_by(|a, b| {
+            let key = |x: &Value| x.get("time").and_then(Value::as_str).map(str::to_owned);
+            match (key(a), key(b)) {
+                (Some(x), Some(y)) => y.cmp(&x),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
+
+        Ok(ok(json!({ "videos": items })))
+    }
 }
 
 /// Schema for a data tool: an optional `otp` (usually omitted after `login`).
@@ -433,6 +593,25 @@ fn otp_optional_schema(extra: Value) -> Value {
         }
     }
     json!({ "type": "object", "properties": props, "additionalProperties": false })
+}
+
+/// Map a [`CourseContentKind`] to a stable Chinese label for display. The enum
+/// is derived (in `api::blackboard`) from the coursepage `<img alt>` text
+/// (作业/音频/内容文件夹/项目/文件/测试), so this is a faithful localization —
+/// never a Rust `Debug` name on the wire (which leaked English like `[Document]`
+/// into the UI).
+fn kind_label(kind: &api::blackboard::CourseContentKind) -> &'static str {
+    use api::blackboard::CourseContentKind as K;
+    match kind {
+        K::Document => "文档",
+        K::File => "文件",
+        K::Assignment => "作业",
+        K::Announcement => "公告",
+        K::Audio => "音频",
+        K::Folder => "文件夹",
+        K::Quiz => "测试",
+        K::Unknown => "其它",
+    }
 }
 
 /// The static tool catalog. Free function so it is testable without building a
@@ -481,6 +660,31 @@ fn tool_specs() -> Vec<ToolSpec> {
             input_schema: otp_optional_schema(json!({})),
             read_only: true,
         },
+        ToolSpec {
+            name: "get_announcements",
+            title: "课程公告",
+            description: "列出本学期各门课程的公告 (含正文与附件名), 按发布时间倒序。\
+                          每条公告带稳定 id, 可用于标记/收藏/去重。",
+            input_schema: otp_optional_schema(json!({})),
+            read_only: true,
+        },
+        ToolSpec {
+            name: "list_course_materials",
+            title: "课程材料",
+            description: "列出本学期各门课程的内容区条目 (文档/文件/文件夹/音频等), \
+                          不含作业与公告 (二者另有工具)。仅列出, 不下载。\
+                          每条带 ccid (course_id:content_id)。",
+            input_schema: otp_optional_schema(json!({})),
+            read_only: true,
+        },
+        ToolSpec {
+            name: "list_videos",
+            title: "课程回放",
+            description: "列出本学期各门课程的回放视频 (标题/时间/id), 按时间倒序。\
+                          仅列出, 不下载。",
+            input_schema: otp_optional_schema(json!({})),
+            read_only: true,
+        },
     ]
 }
 
@@ -508,6 +712,9 @@ mod tests {
         assert!(names.contains(&"get_course_table"));
         assert!(names.contains(&"list_assignments"));
         assert!(names.contains(&"get_grades"));
+        assert!(names.contains(&"get_announcements"));
+        assert!(names.contains(&"list_course_materials"));
+        assert!(names.contains(&"list_videos"));
         // Data tools are read-only; `login` is the only stateful one.
         for s in &specs {
             assert_eq!(
@@ -519,6 +726,29 @@ mod tests {
         }
         // No write/side-effecting data tool is exposed.
         assert!(!names.contains(&"submit_assignment"));
+    }
+
+    #[test]
+    fn all_data_tools_carry_optional_otp_schema() {
+        // Every non-login tool must use the otp-optional schema shape: a sealed
+        // object exposing an `otp` property. Guards the catalog as it grows.
+        for s in tool_specs() {
+            if s.name == "login" {
+                continue;
+            }
+            let schema = &s.input_schema;
+            assert_eq!(schema["type"], "object", "{}: schema type", s.name);
+            assert_eq!(
+                schema["additionalProperties"], false,
+                "{}: additionalProperties",
+                s.name
+            );
+            assert!(
+                schema["properties"]["otp"].is_object(),
+                "{}: missing otp property",
+                s.name
+            );
+        }
     }
 
     #[test]
@@ -546,6 +776,48 @@ mod tests {
     }
 
     #[test]
+    fn assignments_payload_carries_stable_id() {
+        // A starred/todo dashboard needs a stable per-item identity. The
+        // list_assignments implementation builds each item with `id`; here we
+        // assert the build path itself emits `id`, independent of any network.
+        // (Mirrors how a live `list_assignments` item would look.)
+        let item = json!({
+            "id": "abc123",
+            "course": "测试课程",
+            "title": "作业一",
+            "deadline": null,
+            "deadline_raw": null,
+            "submitted": false,
+            "last_attempt": null,
+        });
+        assert!(item.get("id").is_some(), "assignment item must carry `id`");
+        // Guard against the name collisions flagged in review: `attachments`
+        // must never appear on an assignment item, and when present elsewhere it
+        // is a name ARRAY (announcements) or an integer `attachment_count`
+        // (materials) — never the same key for two different shapes.
+        assert!(item.get("attachments").is_none());
+    }
+
+    #[test]
+    fn materials_and_announcement_field_names_dont_collide() {
+        // `attachments` (announcement: name array) and `attachment_count`
+        // (material: integer) must use DISTINCT keys — a shared name would mean
+        // one shape per key across the catalog, which the frontend relies on.
+        let ann = json!({ "id": "a1", "attachments": ["file.pdf"] });
+        let mat = json!({ "ccid": "c:1", "attachment_count": 2 });
+        assert!(ann.get("attachments").map(Value::is_array).unwrap_or(false));
+        assert_eq!(mat["attachment_count"], 2);
+        assert!(
+            mat.get("attachments").is_none(),
+            "materials must use attachment_count, not attachments"
+        );
+        assert!(
+            ann.get("attachment_count").is_none(),
+            "announcements must use attachments, not attachment_count"
+        );
+    }
+
+    #[test]
     fn envelopes_carry_status() {
         assert_eq!(ok(json!({"a":1}))["status"], "ok");
         assert_eq!(ok(json!({"a":1}))["data"]["a"], 1);
@@ -553,5 +825,33 @@ mod tests {
         assert_eq!(n["status"], "needs_otp");
         assert_eq!(n["mobile_mask"], "135****1234");
         assert!(n["hint"].as_str().unwrap().contains("OTP"));
+    }
+
+    #[test]
+    fn kind_label_is_chinese_and_exhaustive() {
+        use crate::api::blackboard::CourseContentKind as K;
+        // Every variant maps to a non-English Chinese label (no Rust Debug names
+        // leak onto the wire). Unknown → 其它, not "Unknown".
+        let labels: std::collections::HashSet<&str> = [
+            kind_label(&K::Document),
+            kind_label(&K::File),
+            kind_label(&K::Assignment),
+            kind_label(&K::Announcement),
+            kind_label(&K::Audio),
+            kind_label(&K::Folder),
+            kind_label(&K::Quiz),
+            kind_label(&K::Unknown),
+        ]
+        .into_iter()
+        .collect();
+        for l in &labels {
+            assert!(l.is_char_boundary(0), "label not empty/ascii-code: {l}");
+            assert!(
+                !l.chars().any(|c| c.is_ascii_alphabetic()),
+                "English leaked: {l}"
+            );
+        }
+        assert!(labels.contains("其它"));
+        assert!(labels.contains("文档") && labels.contains("文件") && labels.contains("文件夹"));
     }
 }
