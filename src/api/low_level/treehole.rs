@@ -85,15 +85,69 @@ impl LowLevelClient {
             return Ok(TreeholeToken { access_token, uuid });
         }
 
-        // body 里没有 token —— 走诊断路径：再请求一次，把响应头（Set-Cookie 等）
-        // dump 出来，判断登录态是否落在 cookie，而不是 JWT。
-        log::warn!("[treehole] no access_token in body; running cookie/redirect diagnostics");
-        self.treehole_diag(&url).await?;
+        // body 里没有 token。cas_iaaa_login 的职责其实是建立 Laravel session
+        //（Set-Cookie XSRF-TOKEN/_session，实测）。真正的 access_token 由 SPA 登录后
+        // 调一个 /api/v6/* 端点换取。spike：用刚落的 session cookie + uuid，依次试
+        // 候选端点，找出返回 access_token 的那个。
+        log::warn!("[treehole] no access_token in cas_iaaa_login body; scanning v6 endpoints");
+        if let Some(access_token) = self.treehole_find_token(&uuid).await? {
+            log::info!("[treehole] access_token via v6 scan (len={})", access_token.len());
+            return Ok(TreeholeToken { access_token, uuid });
+        }
         anyhow::bail!(
-            "cas_iaaa_login 未在 body 返回 access_token（status={status}, body[:160]={:?}）。\
-             已 dump 诊断信息到日志——多半登录态落在 cookie 或需别处换 JWT。",
-            body.chars().take(160).collect::<String>()
+            "未能从 v6 端点换得 access_token（cas_iaaa_login 已建立 session，但 token 端点未命中）。\
+             uuid={uuid}。见日志 [treehole-scan]。"
         )
+    }
+
+    /// spike：用 cas_iaaa_login 落下的 session cookie + uuid，依次试候选 token 端点，
+    /// 返回首个含 access_token 的响应。cas_iaaa_login 成功后 Laravel session 已建立，
+    /// 其一 /api/v6/* 端点会用 uuid 关联出 access_token（Bearer）。
+    async fn treehole_find_token(&self, uuid: &str) -> anyhow::Result<Option<String>> {
+        // 候选（method, path）。带 uuid 头（web SPA 的设备标识）+ XSRF 头（Laravel）。
+        let candidates: &[(bool, &str)] = &[
+            // bool = is_post
+            (false, "/api/v6/iaaa_login"),
+            (false, "/api/v6/iaaa_callback"),
+            (false, "/api/v6/login"),
+            (false, "/api/v6/refresh_token"),
+            (false, "/version"),
+            (true, "/api/v6/iaaa_login"),
+            (true, "/api/v6/iaaa_callback"),
+            (true, "/api/v6/login"),
+        ];
+        for &(is_post, path) in candidates {
+            let url = format!("{TREEHOLE_API}{path}");
+            let fq = if is_post {
+                self.http_client
+                    .post(&url)?
+                    .header("uuid", uuid)?
+                    .header("Content-Type", "application/json")?
+                    .body(format!(r#"{{"uuid":"{uuid}"}}"#))
+                    .send()
+                    .await?
+            } else {
+                self.http_client
+                    .get(&url)?
+                    .header("uuid", uuid)?
+                    .query(&[("uuid", uuid)])?
+                    .send()
+                    .await?
+            };
+            let status = fq.status();
+            let body = fq.text().await.unwrap_or_default();
+            let preview: String = body.chars().take(120).collect();
+            log::info!(
+                "[treehole-scan] {} {path} status={status} len={} body[:120]={preview:?}",
+                if is_post { "POST" } else { "GET " },
+                body.len()
+            );
+            if let Some(tok) = extract_access_token(&body) {
+                log::info!("[treehole-scan] ✓ token found at {path}");
+                return Ok(Some(tok));
+            }
+        }
+        Ok(None)
     }
 
     /// 诊断：dump 一次请求的响应头（Set-Cookie / Location / Content-Type）+ 当前
