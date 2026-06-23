@@ -7,6 +7,7 @@ pub mod portal;
 pub mod syllabus;
 #[cfg(feature = "thesislib")]
 pub mod thesis_lib;
+pub mod treehole;
 
 use anyhow::Context;
 pub use builder::ClientBuilder;

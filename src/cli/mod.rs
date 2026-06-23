@@ -10,6 +10,7 @@ mod cmd_mcp;
 mod cmd_syllabus;
 #[cfg(feature = "thesislib")]
 mod cmd_thesis_lib;
+mod cmd_treehole;
 #[cfg(feature = "ttshitu")]
 mod cmd_ttshitu;
 mod cmd_video;
@@ -121,6 +122,10 @@ enum Commands {
     #[cfg(feature = "thesislib")]
     #[command(visible_alias("th"), arg_required_else_help(true))]
     ThesisLib(cmd_thesis_lib::CommandThesisLib),
+
+    /// 北大树洞（spike：认证 + hole/list 探测）
+    #[command(visible_alias("hole"), arg_required_else_help(true))]
+    Treehole(cmd_treehole::CommandTreehole),
 
     /// (重新) 初始化用户名/密码
     Init,
@@ -368,6 +373,7 @@ pub async fn start(cli: Cli, m: &MultiProgress) -> anyhow::Result<()> {
 
             #[cfg(feature = "thesislib")]
             Commands::ThesisLib(cmd) => cmd_thesis_lib::run(cmd, &ctx).await?,
+            Commands::Treehole(cmd) => cmd_treehole::run(cmd, &ctx).await?,
 
             #[cfg(feature = "dev")]
             Commands::Debug => command_debug().await?,

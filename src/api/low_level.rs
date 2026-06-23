@@ -14,6 +14,8 @@ pub mod syllabus;
 /// 学位论文数据库
 #[cfg(feature = "thesislib")]
 pub mod thesis_lib;
+/// 北大树洞 (PKU Helper)
+pub mod treehole;
 
 use anyhow::Context as _;
 use rand::Rng as _;
