@@ -18,9 +18,12 @@ pub const TREEHOLE_APP_ID: &str = "PKU Helper";
 /// IAAA 登录后的回调入口（oauth.jsp 携带的 redirectUrl）。
 pub const TREEHOLE_CAS_LOGIN: &str = "https://treehole.pku.edu.cn/chapi/cas_iaaa_login";
 /// 发起 IAAA 重定向的入口（web 平台）。
+#[allow(dead_code)]
 pub const TREEHOLE_REDIRECT_IAAA: &str = "https://treehole.pku.edu.cn/chapi/redirect_iaaa_login";
-/// API 基址。
-pub const TREEHOLE_API: &str = "https://treehole.pku.edu.cn";
+/// API 基址。**关键**：web 端 axios baseURL = host + "/chapi/"，所以 bundle 里的
+/// 相对路径 `/api/v3/...` 实际拼成 `{host}/chapi/api/v3/...`。裸 `/api/v3/...`
+/// 返回 Laravel 404；带 `/chapi/` 前缀才命中路由（实测：401 未鉴权 vs 404）。
+pub const TREEHOLE_API: &str = "https://treehole.pku.edu.cn/chapi";
 
 /// 树洞访问令牌（app-JWT）。
 #[derive(Debug, Clone)]
