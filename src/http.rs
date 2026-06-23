@@ -79,6 +79,19 @@ impl Client {
         *self.cookie_store.write().unwrap() = cookie_store;
         Ok(())
     }
+
+    /// Read a cookie's (URL-decoded) value by name + URL. Returns the *raw* cookie
+    /// value as the server set it; callers that need the URL-decoded form (e.g.
+    /// Laravel's XSRF-TOKEN, echoed back in the `X-XSRF-TOKEN` header) can decode.
+    pub fn cookie_value(&self, url: &url::Url, name: &str) -> Option<String> {
+        let store = self.cookie_store.read().unwrap();
+        for c in store.matches(url) {
+            if c.name() == name {
+                return Some(c.value().to_owned());
+            }
+        }
+        None
+    }
 }
 
 /// A wrapper around `cyper::RequestBuilder` that can record response cookies.

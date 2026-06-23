@@ -86,91 +86,89 @@ impl LowLevelClient {
         }
 
         // body 里没有 token。cas_iaaa_login 的职责其实是建立 Laravel session
-        //（Set-Cookie XSRF-TOKEN/_session，实测）。真正的 access_token 由 SPA 登录后
-        // 调一个 /api/v6/* 端点换取。spike：用刚落的 session cookie + uuid，依次试
-        // 候选端点，找出返回 access_token 的那个。
-        log::warn!("[treehole] no access_token in cas_iaaa_login body; scanning v6 endpoints");
-        if let Some(access_token) = self.treehole_find_token(&uuid).await? {
-            log::info!("[treehole] access_token via v6 scan (len={})", access_token.len());
+        //（Set-Cookie XSRF-TOKEN/_session，实测）。真正的 access_token（Bearer）由
+        // SPA 登录后调 /api/v6/login 用账密换取（bundle 的 loginPath + localStorage
+        // token；axios 拦截器给所有请求挂 Authorization: Bearer + uuid 头）。Laravel
+        // 的 POST 还要求 X-XSRF-TOKEN 头（从 XSRF-TOKEN cookie URL-decode 回填）。
+        log::warn!("[treehole] no access_token in cas_iaaa_login body; trying v6/login");
+        if let Some(access_token) = self
+            .treehole_find_token(&uuid, username, password)
+            .await?
+        {
+            log::info!("[treehole] access_token via v6/login (len={})", access_token.len());
             return Ok(TreeholeToken { access_token, uuid });
         }
         anyhow::bail!(
-            "未能从 v6 端点换得 access_token（cas_iaaa_login 已建立 session，但 token 端点未命中）。\
-             uuid={uuid}。见日志 [treehole-scan]。"
+            "未能从 v6/login 换得 access_token（cas_iaaa_login 已建立 session）。uuid={uuid}。见日志 [treehole-scan]。"
         )
     }
 
-    /// spike：用 cas_iaaa_login 落下的 session cookie + uuid，依次试候选 token 端点，
-    /// 返回首个含 access_token 的响应。cas_iaaa_login 成功后 Laravel session 已建立，
-    /// 其一 /api/v6/* 端点会用 uuid 关联出 access_token（Bearer）。
-    async fn treehole_find_token(&self, uuid: &str) -> anyhow::Result<Option<String>> {
-        // 候选（method, path）。带 uuid 头（web SPA 的设备标识）+ XSRF 头（Laravel）。
-        let candidates: &[(bool, &str)] = &[
-            // bool = is_post
-            (false, "/api/v6/iaaa_login"),
-            (false, "/api/v6/iaaa_callback"),
-            (false, "/api/v6/login"),
-            (false, "/api/v6/refresh_token"),
-            (false, "/version"),
-            (true, "/api/v6/iaaa_login"),
-            (true, "/api/v6/iaaa_callback"),
-            (true, "/api/v6/login"),
-        ];
-        for &(is_post, path) in candidates {
-            let url = format!("{TREEHOLE_API}{path}");
-            let fq = if is_post {
-                self.http_client
-                    .post(&url)?
-                    .header("uuid", uuid)?
-                    .header("Content-Type", "application/json")?
-                    .body(format!(r#"{{"uuid":"{uuid}"}}"#))
-                    .send()
-                    .await?
-            } else {
-                self.http_client
-                    .get(&url)?
-                    .header("uuid", uuid)?
-                    .query(&[("uuid", uuid)])?
-                    .send()
-                    .await?
-            };
-            let status = fq.status();
-            let body = fq.text().await.unwrap_or_default();
-            let preview: String = body.chars().take(120).collect();
-            log::info!(
-                "[treehole-scan] {} {path} status={status} len={} body[:120]={preview:?}",
-                if is_post { "POST" } else { "GET " },
-                body.len()
-            );
-            if let Some(tok) = extract_access_token(&body) {
-                log::info!("[treehole-scan] ✓ token found at {path}");
+    /// spike：POST /api/v6/login（账密 → access_token）。Laravel 需要 X-XSRF-TOKEN 头
+    /// （从 XSRF-TOKEN cookie 解码）+ Referer/Origin。也试 IAAA uuid 流作 fallback。
+    async fn treehole_find_token(
+        &self,
+        uuid: &str,
+        username: &str,
+        password: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let api_url = url::Url::parse(TREEHOLE_API).unwrap();
+        let xsrf = self.http_client.cookie_value(&api_url, "XSRF-TOKEN");
+        let xsrf_decoded = xsrf
+            .as_deref()
+            .map(percent_decode);
+        log::info!(
+            "[treehole-scan] XSRF-TOKEN cookie present={} decoded_len={}",
+            xsrf.is_some(),
+            xsrf_decoded.as_deref().map(|s| s.len()).unwrap_or(0),
+        );
+
+        // 主路径：POST /api/v6/login {username, password} + uuid + CSRF。
+        let login_url = format!("{TREEHOLE_API}/api/v6/login");
+        let mut req = self
+            .http_client
+            .post(&login_url)?
+            .header("uuid", uuid)?
+            .header("Content-Type", "application/json")?
+            .header("Accept", "application/json, text/plain, */*")?
+            .header("Origin", "https://treehole.pku.edu.cn")?
+            .header("Referer", "https://treehole.pku.edu.cn/ch/web/")?;
+        if let Some(d) = &xsrf_decoded {
+            req = req.header("X-XSRF-TOKEN", d)?;
+        }
+        // JSON body —— 字段名按 bundle（userName/password 也试 username/password）。
+        let body = format!(r#"{{"userName":"{username}","password":"{password}","uuid":"{uuid}"}}"#);
+        let res = req.body(body).send().await?;
+        let status = res.status();
+        let rb = res.text().await.unwrap_or_default();
+        log::info!(
+            "[treehole-scan] POST /api/v6/login status={status} len={} body[:200]={:?}",
+            rb.len(),
+            rb.chars().take(200).collect::<String>(),
+        );
+        if let Some(tok) = extract_access_token(&rb) {
+            log::info!("[treehole-scan] ✓ token via POST /api/v6/login");
+            return Ok(Some(tok));
+        }
+
+        // fallback：GET uuid 流（万一）。
+        for path in ["/api/v6/iaaa_callback", "/api/v6/iaaa_login"] {
+            let u = format!("{TREEHOLE_API}{path}");
+            let res = self
+                .http_client
+                .get(&u)?
+                .header("uuid", uuid)?
+                .query(&[("uuid", uuid)])?
+                .send()
+                .await?;
+            let st = res.status();
+            let b = res.text().await.unwrap_or_default();
+            log::info!("[treehole-scan] GET {path} status={st} len={}", b.len());
+            if let Some(tok) = extract_access_token(&b) {
+                log::info!("[treehole-scan] ✓ token via GET {path}");
                 return Ok(Some(tok));
             }
         }
         Ok(None)
-    }
-
-    /// 诊断：dump 一次请求的响应头（Set-Cookie / Location / Content-Type）+ 当前
-    /// cookie jar 内容，帮 spike 判定登录态落点。spike 专用，产品码不用。
-    async fn treehole_diag(&self, url: &str) -> anyhow::Result<()> {
-        let res = self.http_client.get(url)?.send().await?;
-        let status = res.status();
-        log::info!("[treehole-diag] status={status}");
-        for (k, v) in res.headers().iter() {
-            log::info!("[treehole-diag]   header {k}: {}", String::from_utf8_lossy(v.as_bytes()));
-        }
-        // cookie jar 当前内容（save_set_cookies 落临时文件后读回）。
-        let tmp = std::env::temp_dir().join("myal1s-treehole-cookies.json");
-        let _ = self.save_set_cookies(&tmp).await;
-        if let Ok(s) = std::fs::read_to_string(&tmp) {
-            // 只 dump 树洞相关行，避免刷屏。
-            let relevant: Vec<&str> = s
-                .lines()
-                .filter(|l| l.contains("treehole") || l.contains("pku.edu.cn"))
-                .collect();
-            log::info!("[treehole-diag] cookie jar (treehole lines): {relevant:?}");
-        }
-        Ok(())
     }
 
     /// 带鉴权头 GET 一个树洞 JSON 端点，返回原始文本（spike 用，解析留给上层）。
@@ -230,6 +228,29 @@ fn extract_access_token(body: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Percent-decode a cookie value (Laravel's XSRF-TOKEN cookie is URL-encoded;
+/// it must be decoded before echoing back in the `X-XSRF-TOKEN` header).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                16,
+            ) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// 简易 v4 UUID（无 uuid crate 依赖；spike 用）。标准 8-4-4-4-12 hex（36 字符）。
