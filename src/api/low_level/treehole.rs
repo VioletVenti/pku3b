@@ -74,15 +74,46 @@ impl LowLevelClient {
         log::info!("[treehole] cas_iaaa_login status={status} body.len={}", body.len());
         log::debug!("[treehole] cas_iaaa_login body: {body}");
 
-        // 尝试解析为 JWT 信封（{access_token, ...} 或 {data:{access_token}} 等）。
-        let access_token = extract_access_token(&body)
-            .ok_or_else(|| anyhow::anyhow!(
-                "cas_iaaa_login 未返回 access_token（status={status}, body[:200]={:?})",
-                body.chars().take(200).collect::<String>()
-            ))?;
-        log::info!("[treehole] access_token acquired (len={})", access_token.len());
+        // cas_iaaa_login 的真实形态尚未探明（spike 阶段）：它可能 (a) 在 JSON body
+        // 里直接返回 access_token，或 (b) 落 cookie（Set-Cookie）+ 把浏览器重定向回
+        // SPA。先试 body 解析；失败时记录详细诊断（headers）供 probe 迭代。
+        if let Some(access_token) = extract_access_token(&body) {
+            log::info!("[treehole] access_token from body (len={})", access_token.len());
+            return Ok(TreeholeToken { access_token, uuid });
+        }
 
-        Ok(TreeholeToken { access_token, uuid })
+        // body 里没有 token —— 走诊断路径：再请求一次，把响应头（Set-Cookie 等）
+        // dump 出来，判断登录态是否落在 cookie，而不是 JWT。
+        log::warn!("[treehole] no access_token in body; running cookie/redirect diagnostics");
+        self.treehole_diag(&url).await?;
+        anyhow::bail!(
+            "cas_iaaa_login 未在 body 返回 access_token（status={status}, body[:160]={:?}）。\
+             已 dump 诊断信息到日志——多半登录态落在 cookie 或需别处换 JWT。",
+            body.chars().take(160).collect::<String>()
+        )
+    }
+
+    /// 诊断：dump 一次请求的响应头（Set-Cookie / Location / Content-Type）+ 当前
+    /// cookie jar 内容，帮 spike 判定登录态落点。spike 专用，产品码不用。
+    async fn treehole_diag(&self, url: &str) -> anyhow::Result<()> {
+        let res = self.http_client.get(url)?.send().await?;
+        let status = res.status();
+        log::info!("[treehole-diag] status={status}");
+        for (k, v) in res.headers().iter() {
+            log::info!("[treehole-diag]   header {k}: {}", String::from_utf8_lossy(v.as_bytes()));
+        }
+        // cookie jar 当前内容（save_set_cookies 落临时文件后读回）。
+        let tmp = std::env::temp_dir().join("myal1s-treehole-cookies.json");
+        let _ = self.save_set_cookies(&tmp).await;
+        if let Ok(s) = std::fs::read_to_string(&tmp) {
+            // 只 dump 树洞相关行，避免刷屏。
+            let relevant: Vec<&str> = s
+                .lines()
+                .filter(|l| l.contains("treehole") || l.contains("pku.edu.cn"))
+                .collect();
+            log::info!("[treehole-diag] cookie jar (treehole lines): {relevant:?}");
+        }
+        Ok(())
     }
 
     /// 带鉴权头 GET 一个树洞 JSON 端点，返回原始文本（spike 用，解析留给上层）。
@@ -101,8 +132,24 @@ impl LowLevelClient {
             .await?;
         let status = res.status();
         let body = res.text().await?;
-        log::debug!("[treehole] GET {path} status={status}");
+        log::debug!("[treehole] GET {path} (bearer) status={status}");
         anyhow::ensure!(status.is_success(), "treehole {path} 失败: {status}\n{}", body);
+        Ok(body)
+    }
+
+    /// Cookie-only GET（依赖 cas_iaaa_login 落在共享 jar 里的 cookie；像教学网模型）。
+    /// spike 用：判定树洞 web 端是否是 cookie 鉴权而非 Bearer。
+    pub async fn treehole_api_get_cookie_only(&self, path: &str) -> anyhow::Result<String> {
+        let url = format!("{TREEHOLE_API}{path}");
+        let res = self.http_client.get(&url)?.send().await?;
+        let status = res.status();
+        let body = res.text().await?;
+        log::debug!("[treehole] GET {path} (cookie-only) status={status}");
+        anyhow::ensure!(
+            status.is_success(),
+            "treehole {path} (cookie-only) 失败: {status}\n{}",
+            body
+        );
         Ok(body)
     }
 }
