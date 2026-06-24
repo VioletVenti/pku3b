@@ -56,14 +56,31 @@ impl Treehole {
             .await
     }
 
-    /// 提交短信验证码完成验证。
-    pub async fn verify_sms(&self, code: &str) -> anyhow::Result<String> {
-        let body = format!(r#"{{"code":"{code}"}}"#);
-        self.client
+    /// 提交短信验证码完成验证。字段名 bundle 压缩里抓不到，依次试候选，首个不再
+    /// 返回 40001（"请填写短信验证码"）即命中。返回 (命中的字段名, 响应)。
+    pub async fn verify_sms(&self, code: &str) -> anyhow::Result<(String, String)> {
+        for field in ["smsCode", "verifyCode", "code", "msgCode", "otp", "sms_code"] {
+            let body = format!(r#"{{"{field}":"{code}"}}"#);
+            let resp = self
+                .client
+                .0
+                .http_client
+                .treehole_api_post(&self.session, "/api/jwt_msg_verify", &body)
+                .await?;
+            if !resp.contains("40001") {
+                return Ok((field.to_string(), resp));
+            }
+            log::warn!("[treehole] verify 字段 {field} 仍 40001，试下一个");
+        }
+        // 全部候选都 40001 —— 返回最后一次响应供诊断。
+        let body = format!(r#"{{"smsCode":"{code}"}}"#);
+        let resp = self
+            .client
             .0
             .http_client
             .treehole_api_post(&self.session, "/api/jwt_msg_verify", &body)
-            .await
+            .await?;
+        Ok(("?".to_string(), resp))
     }
 
     /// 暴露 session（probe 诊断用）。

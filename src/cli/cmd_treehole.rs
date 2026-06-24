@@ -119,10 +119,13 @@ async fn verify(ctx: &CommandCtx<'_>, otp: Option<String>) -> anyhow::Result<()>
     // 2. 用户输入收到的短信码。
     let code = inquire::Text::new("请输入收到的树洞短信验证码: ").prompt()?;
 
-    // 3. 提交验证。
+    // 3. 提交验证（自动试字段名）。
     println!("{}提交短信验证…", BL);
     match th.verify_sms(&code).await {
-        Ok(b) => println!("{GR}{B}✓ 验证响应{B:#}: {}{GR:#}", b.chars().take(200).collect::<String>()),
+        Ok((field, b)) => println!(
+            "{GR}{B}✓ 验证响应{B:#} [字段={field}]: {}{GR:#}",
+            b.chars().take(200).collect::<String>(),
+        ),
         Err(e) => println!("{RD}✗ 验证失败: {e:#}{RD:#}"),
     }
 
