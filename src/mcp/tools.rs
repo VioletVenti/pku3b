@@ -165,6 +165,20 @@ impl ToolRegistry {
                 let page = args.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
                 self.treehole_attention(page, otp).await
             }
+            "treehole_search" => {
+                let keyword = args.get("keyword").and_then(Value::as_str).unwrap_or("");
+                let page = args.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
+                self.treehole_search(keyword, page, otp).await
+            }
+            "treehole_messages" => {
+                let mtype = args.get("message_type").and_then(Value::as_str).unwrap_or("int_msg");
+                let page = args.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
+                self.treehole_messages(mtype, page, otp).await
+            }
+            "treehole_unread" => {
+                let mtype = args.get("message_type").and_then(Value::as_str).unwrap_or("int_msg");
+                self.treehole_unread(mtype, otp).await
+            }
             other => return Err(ToolError::UnknownTool(other.to_string())),
         };
         result.map_err(|e| ToolError::Internal(format!("{e:#}")))
@@ -584,6 +598,44 @@ impl ToolRegistry {
             .await
     }
 
+    async fn treehole_search(&self, keyword: &str, page: u32, otp: Option<&str>) -> anyhow::Result<Value> {
+        let kw = keyword.to_owned();
+        self.treehole_with(otp, move |th| async move { th.search(&kw, page, 20).await })
+            .await
+    }
+
+    async fn treehole_messages(&self, mtype: &str, page: u32, otp: Option<&str>) -> anyhow::Result<Value> {
+        let cfg = self.cfg().await?;
+        let th = match auth::login_treehole(&self.client, &cfg, otp).await? {
+            LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
+            LoginOutcome::Ready(th) => th,
+        };
+        self.save_session().await;
+        let msgs = th.messages(mtype, page).await.map_err(|e| {
+            if format!("{e:#}").contains("code=40002") {
+                anyhow::anyhow!("needs_treehole_token")
+            } else { e }
+        })?;
+        let items: Vec<Value> = msgs.iter().map(|m| json!({
+            "description": m.description, "pid": m.pid, "time": m.time,
+        })).collect();
+        Ok(ok(json!({ "messages": items })))
+    }
+
+    async fn treehole_unread(&self, mtype: &str, otp: Option<&str>) -> anyhow::Result<Value> {
+        let cfg = self.cfg().await?;
+        let th = match auth::login_treehole(&self.client, &cfg, otp).await? {
+            LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
+            LoginOutcome::Ready(th) => th,
+        };
+        self.save_session().await;
+        match th.unread_count(mtype).await {
+            Ok(n) => Ok(ok(json!({ "count": n }))),
+            Err(e) if format!("{e:#}").contains("code=40002") => Ok(needs_treehole_token()),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn get_grades(&self, otp: Option<&str>) -> anyhow::Result<Value> {
         let cfg = self.cfg().await?;
         let bb = match auth::login_blackboard(&self.client, &cfg, otp).await? {
@@ -963,6 +1015,35 @@ fn tool_specs() -> Vec<ToolSpec> {
             description: "列出当前账号在树洞关注的帖子。",
             input_schema: otp_optional_schema(json!({
                 "page": { "type": "integer", "description": "页码, 默认 1" }
+            })),
+            read_only: true,
+        },
+        ToolSpec {
+            name: "treehole_search",
+            title: "树洞 · 搜索",
+            description: "按关键词搜索树洞帖子。适合「帮我查树洞里关于 XXX 的讨论」。",
+            input_schema: otp_optional_schema(json!({
+                "keyword": { "type": "string", "description": "搜索关键词" },
+                "page": { "type": "integer", "description": "页码, 默认 1" }
+            })),
+            read_only: true,
+        },
+        ToolSpec {
+            name: "treehole_messages",
+            title: "树洞 · 通知",
+            description: "列出树洞消息通知（关注的帖子有新回复等）。message_type: int_msg(关注更新) / sys_msg(系统)。",
+            input_schema: otp_optional_schema(json!({
+                "message_type": { "type": "string", "description": "int_msg(关注) 或 sys_msg(系统), 默认 int_msg" },
+                "page": { "type": "integer", "description": "页码, 默认 1" }
+            })),
+            read_only: true,
+        },
+        ToolSpec {
+            name: "treehole_unread",
+            title: "树洞 · 未读数",
+            description: "获取树洞未读消息计数（关注更新 / 系统）。",
+            input_schema: otp_optional_schema(json!({
+                "message_type": { "type": "string", "description": "int_msg 或 sys_msg, 默认 int_msg" }
             })),
             read_only: true,
         },

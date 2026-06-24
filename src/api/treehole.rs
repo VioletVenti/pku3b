@@ -159,6 +159,50 @@ impl Treehole {
         Ok(d.list.into_iter().map(raw_to_hole).collect())
     }
 
+    /// 关键词搜索帖子（hole/list?keyword=…）。实测 401（路由存在，需鉴权）。
+    pub async fn search(&self, keyword: &str, page: u32, limit: u32) -> anyhow::Result<Vec<Hole>> {
+        #[derive(serde::Deserialize)]
+        struct D {
+            list: Vec<RawHole>,
+        }
+        let kw = percent_encoding::utf8_percent_encode(keyword, percent_encoding::NON_ALPHANUMERIC);
+        let path = format!("/api/v3/hole/list?keyword={kw}&page={page}&limit={limit}");
+        let d: D = self.get_v3(&path).await?;
+        Ok(d.list.into_iter().map(raw_to_hole).collect())
+    }
+
+    /// 未读消息计数。message_type: "int_msg"（关注帖子更新）/ "sys_msg"（系统）。
+    pub async fn unread_count(&self, message_type: &str) -> anyhow::Result<i64> {
+        #[derive(serde::Deserialize)]
+        struct D {
+            count: i64,
+        }
+        let path = format!("/api/v3/message/un_read?message_type={message_type}");
+        let d: D = self.get_v3(&path).await?;
+        Ok(d.count)
+    }
+
+    /// 消息列表（通知——关注帖子的新回复等）。
+    pub async fn messages(&self, message_type: &str, page: u32) -> anyhow::Result<Vec<TreeholeMessage>> {
+        #[derive(serde::Deserialize)]
+        struct D {
+            list: Vec<RawMessage>,
+        }
+        let path = format!("/api/v3/message/index?message_type={message_type}&page={page}&limit=20");
+        let d: D = self.get_v3(&path).await?;
+        Ok(d.list.into_iter().map(RawMessage::into_msg).collect())
+    }
+
+    /// 收藏夹列表。
+    pub async fn bookmarks(&self) -> anyhow::Result<Vec<TreeholeBookmark>> {
+        #[derive(serde::Deserialize)]
+        struct D {
+            list: Vec<RawBookmark>,
+        }
+        let d: D = self.get_v3("/api/v3/bookmark/list?page=1&limit=60").await?;
+        Ok(d.list.into_iter().map(RawBookmark::into_bm).collect())
+    }
+
     // ---- 令牌验证门（首次登录后 API 返 code=40002 时用）----
 
     /// 取令牌提示（如「请输入北京大学App手机令牌」）。
@@ -220,7 +264,6 @@ struct RawHole {
 
 fn raw_to_hole(r: RawHole) -> Hole {
     let time = if r.timestamp > 0 {
-        // 秒级 epoch → RFC3339。
         chrono::DateTime::from_timestamp(r.timestamp, 0).map(|dt| dt.to_rfc3339())
     } else {
         None
@@ -233,5 +276,61 @@ fn raw_to_hole(r: RawHole) -> Hole {
         likenum: r.likenum,
         tag: r.tag,
         time,
+    }
+}
+
+// ---- 消息 / 收藏 ----
+
+/// 一条通知消息（关注帖子有新回复等）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TreeholeMessage {
+    pub description: String,
+    pub pid: Option<i64>,
+    pub time: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawMessage {
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    pid: Option<i64>,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+impl RawMessage {
+    fn into_msg(self) -> TreeholeMessage {
+        TreeholeMessage {
+            description: self.description,
+            pid: self.pid,
+            time: self.created_at,
+        }
+    }
+}
+
+/// 一个收藏夹。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TreeholeBookmark {
+    pub id: i64,
+    pub name: String,
+    pub hole_count: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawBookmark {
+    id: i64,
+    bookmark_name: String,
+    #[serde(default)]
+    hole_count: i64,
+}
+
+impl RawBookmark {
+    fn into_bm(self) -> TreeholeBookmark {
+        TreeholeBookmark {
+            id: self.id,
+            name: self.bookmark_name,
+            hole_count: self.hole_count,
+        }
     }
 }
