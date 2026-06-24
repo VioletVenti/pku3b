@@ -1,37 +1,42 @@
 //! 北大树洞 (treehole.pku.edu.cn) 低层 API
 //!
-//! 认证模型（HAR 实测，非猜测）：
-//! - IAAA 半段复用 [`super::iaaa::iaaa_oauth_login`]，appid = `PKU Helper`。trusted-
-//!   device 机制使一次 OTP 后通常免 OTP（与教学网同 cookie jar）。
-//! - 服务半段是 **Laravel session + CSRF**，**不是** Bearer/`access_token`：登录 =
-//!   带 IAAA token 访问 `cas_iaaa_login` → 服务端建立 Laravel session（Set-Cookie
-//!   `XSRF-TOKEN` + `_session`）。此后所有 `/chapi/api/v3/*` 请求只需：
-//!     · session cookie（共享 jar 自动带）
-//!     · `uuid` 头（web 设备标识，形如 `Web_PKUHOLE_2.0.0_WEB_UUID_<rand>`）
-//!     · `X-XSRF-TOKEN` 头（取 `XSRF-TOKEN` cookie 的值原样回填，无需 decode）
-//!   HAR 确认成功请求**无 `Authorization` 头** —— bundle 里的 `Bearer` 是手机 app
-//!   端逻辑，web 端不用。
-//! - API base = `https://treehole.pku.edu.cn/chapi`（bundle `s2e=origin+"/chapi/"`）。
+//! 认证模型（两份 HAR 实测，非猜测）：
+//! - IAAA 半段：复用 [`super::iaaa::iaaa_oauth_login`]，appid = `PKU Helper`。
+//! - 服务半段：IAAA token → GET `/cas_iaaa_login?uuid=<tail12>&plat=web&token=<IAAA>`
+//!   （**注意：在根 `/cas_iaaa_login`，不是 `/chapi/cas_iaaa_login`**）。成功 →
+//!   302 → `/web/iaaa_success?token=<JWT>`（HS256 access_token，前端存 localStorage），
+//!   并 Set-Cookie Laravel session（`XSRF-TOKEN`/`_session`）。
+//! - **API 鉴权**（HAR 实测成功的 `/chapi/api/v3/*` 请求）：Laravel session cookie
+//!   + `uuid` 头 + `X-XSRF-TOKEN` 头，**无 `Authorization`**（Bearer 是手机 app 路径）。
+//! - uuid 两段：完整 `Web_PKUHOLE_2.0.0_WEB_UUID_<v4hex>`（设备标识 + `uuid` 头），
+//!   但 IAAA redirectUrl + cas_iaaa_login 的 `?uuid=` 用其**尾 12 位 hex**。
+//! - 路径 base：登录走根（`/redirect_iaaa_login`、`/cas_iaaa_login`、`/web/`）；
+//!   API 走 `/chapi`。
 
 use anyhow::Context as _;
 use super::LowLevelClient;
 
-/// IAAA appid —— 树洞走「PKU Helper」（实测 oauth.jsp 重定向携带此 appID）。
+/// IAAA appid —— 树洞走「PKU Helper」。
 pub const TREEHOLE_APP_ID: &str = "PKU Helper";
-/// IAAA 登录后的回调入口（建立 Laravel session）。
-pub const TREEHOLE_CAS_LOGIN: &str = "https://treehole.pku.edu.cn/chapi/cas_iaaa_login";
-/// 发起 IAAA 重定向的入口（web 平台）。
+/// IAAA 登录后的回调（**根路径**，建立 session + 签发 JWT）。
+pub const TREEHOLE_CAS_LOGIN: &str = "https://treehole.pku.edu.cn/cas_iaaa_login";
+/// 发起 IAAA 重定向的入口（根路径，web 平台）。
 #[allow(dead_code)]
-pub const TREEHOLE_REDIRECT_IAAA: &str = "https://treehole.pku.edu.cn/chapi/redirect_iaaa_login";
+pub const TREEHOLE_REDIRECT_IAAA: &str = "https://treehole.pku.edu.cn/redirect_iaaa_login";
 /// API 基址（web 端 axios baseURL = host + "/chapi/"）。
 pub const TREEHOLE_API: &str = "https://treehole.pku.edu.cn/chapi";
+/// 登录成功着陆页（cas_iaaa_login 302 到此，query 带 access_token JWT）。
+pub const TREEHOLE_IAAA_SUCCESS: &str = "https://treehole.pku.edu.cn/web/iaaa_success";
 
-/// 树洞会话句柄。无 access_token —— 鉴权靠共享 jar 里的 Laravel session cookie，
-/// 外加每个请求的 `uuid` + `X-XSRF-TOKEN` 头（low-level 自动注入）。
+/// 树洞会话句柄。鉴权靠 Laravel session cookie（共享 jar），每请求加 `uuid` +
+/// `X-XSRF-TOKEN` 头。`access_token`（JWT）也保留——个别端点可能用 Bearer。
 #[derive(Debug, Clone)]
 pub struct TreeholeSession {
-    /// web 设备 UUID，形如 `Web_PKUHOLE_2.0.0_WEB_UUID_<rand>`。
+    /// 完整 web 设备 UUID：`Web_PKUHOLE_2.0.0_WEB_UUID_<v4hex>`（随 `uuid` 头发送）。
     pub uuid: String,
+    /// access_token（HS256 JWT，来自 /web/iaaa_success?token=…）。API 主路径用 cookie，
+    /// 但保留以备 Bearer 端点。
+    pub access_token: Option<String>,
 }
 
 impl LowLevelClient {
@@ -41,40 +46,59 @@ impl LowLevelClient {
         Ok(data.authen_mode == "OTP")
     }
 
-    /// 树洞登录：IAAA（OTP）→ cas_iaaa_login 建立 Laravel session。返回会话句柄
-    ///（uuid）。之后的 API 请求由 [`treehole_api_get`] 自动带 session cookie +
-    /// `uuid` + `X-XSRF-TOKEN` 头。
+    /// 树洞登录：IAAA（OTP）→ cas_iaaa_login（根路径，尾 12 位 uuid）→ iaaa_success
+    /// （拿 JWT）+ 建立 Laravel session。返回会话句柄。
     pub async fn treehole_login(
         &self,
         username: &str,
         password: &str,
         otp_code: &str,
     ) -> anyhow::Result<TreeholeSession> {
-        // web 设备 UUID（HAR 实测格式）。
+        // 完整 web UUID（HAR: localStorage pku-uuid）。
         let uuid = pku_web_uuid();
-        let redir = format!("{TREEHOLE_CAS_LOGIN}?version=3&uuid={uuid}&plat=web");
+        let uuid_tail = uuid_tail12(&uuid);
 
-        // IAAA 半段：复用 oauthlogin.do，appid=PKU Helper。
+        // IAAA 半段：redirUrl 用 cas_iaaa_login（根）+ 尾 12 位 uuid（HAR 实测）。
+        let redir = format!("{TREEHOLE_CAS_LOGIN}?uuid={uuid_tail}&plat=web");
         let token = self
             .iaaa_oauth_login(TREEHOLE_APP_ID, username, password, otp_code, &redir)
             .await
             .context("IAAA oauth login (PKU Helper) 失败")?;
         log::info!("[treehole] IAAA token acquired (len={})", token.len());
 
-        // 服务半段：带 IAAA token 访问 cas_iaaa_login，建立 Laravel session。
-        // 有效 token → 200（SPA HTML）+ Set-Cookie XSRF-TOKEN/_session；无效 → 302 登录异常。
-        let url = format!("{TREEHOLE_CAS_LOGIN}?version=3&uuid={uuid}&plat=web&token={token}");
-        let res = self.http_client.get(&url)?.send().await?;
+        // 服务半段：GET cas_iaaa_login（根路径，尾 12 位 uuid + IAAA token）。
+        // 成功 → 302 → /web/iaaa_success?token=<JWT>。pku3b 跟随重定向，最终 URL 即
+        // iaaa_success；从其 query 取 JWT。过程中 cas_iaaa_login 的 Set-Cookie（Laravel
+        // session）由 send() 在最终响应采集——但 302 的 Set-Cookie 会丢，故下面也兜底
+        // 直访 iaaa_success 让其 cookie 落 jar。
+        let cas_url = format!(
+            "{TREEHOLE_CAS_LOGIN}?uuid={uuid_tail}&plat=web&_rand=0&token={token}"
+        );
+        let res = self.http_client.get(&cas_url)?.send().await?;
+        let final_url = res.url().clone();
         let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        log::info!("[treehole] cas_iaaa_login status={status} body.len={}", body.len());
-        // 校验 session 落了：XSRF-TOKEN cookie 应存在。
-        let api_url = url::Url::parse(TREEHOLE_API).unwrap();
-        let xsrf = self.http_client.cookie_value(&api_url, "XSRF-TOKEN");
-        if xsrf.is_none() {
-            log::warn!("[treehole] XSRF-TOKEN cookie 未落（cas_iaaa_login 可能未建立 session）");
+        log::info!("[treehole] cas_iaaa_login → final status={status} url={final_url}");
+
+        // 从最终 URL（iaaa_success?token=<JWT>）提取 access_token。
+        let access_token = final_url
+            .query_pairs()
+            .find(|(k, _)| k == "token")
+            .map(|(_, v)| v.to_string());
+        if let Some(t) = &access_token {
+            log::info!("[treehole] access_token (JWT) acquired from iaaa_success (len={})", t.len());
+        } else {
+            log::warn!("[treehole] 未能从 iaaa_success URL 取 access_token（final={final_url}）");
         }
-        Ok(TreeholeSession { uuid })
+
+        // 兜底：确保 iaaa_success 的 cookie（Laravel session）落 jar。
+        if let Some(t) = &access_token {
+            let _ = self
+                .http_client
+                .get(&format!("{TREEHOLE_IAAA_SUCCESS}?token={t}"))?
+                .send()
+                .await?;
+        }
+        Ok(TreeholeSession { uuid, access_token })
     }
 
     /// 鉴权 GET：session cookie（共享 jar 自动）+ `uuid` 头 + `X-XSRF-TOKEN` 头。
@@ -106,6 +130,15 @@ impl LowLevelClient {
 /// bundle: `localStorage.pku-uuid = "Web_PKUHOLE_2.0.0_WEB_UUID_" + pz()`。
 fn pku_web_uuid() -> String {
     format!("Web_PKUHOLE_2.0.0_WEB_UUID_{}", uuid_v4_hex())
+}
+
+/// 取完整 UUID 的尾 12 位 hex（HAR: IAAA redirectUrl + cas_iaaa_login 的 `?uuid=`
+/// 用尾段，如 `4a1e5d9f2f6a`，不是完整字符串）。
+fn uuid_tail12(full: &str) -> String {
+    // 取 `<hex>` 的最后 12 字符（v4 hex 尾段足以唯一）。
+    let hex_part = full.rsplit('_').next().unwrap_or(full);
+    let len = hex_part.len();
+    hex_part[len.saturating_sub(12)..].to_string()
 }
 
 /// 标准 v4 UUID hex（8-4-4-4-12）。无 uuid crate 依赖。
