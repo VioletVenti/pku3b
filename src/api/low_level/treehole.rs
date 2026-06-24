@@ -1,17 +1,21 @@
 //! 北大树洞 (treehole.pku.edu.cn) 低层 API
 //!
-//! 认证模型（两份 HAR 实测，非猜测）：
+//! 认证模型（两份 HAR + otp-chunk 实测，非猜测；详见 memory
+//! `myal1s-p3-treehole-protocol`）：
 //! - IAAA 半段：复用 [`super::iaaa::iaaa_oauth_login`]，appid = `PKU Helper`。
 //! - 服务半段：IAAA token → GET `/cas_iaaa_login?uuid=<tail12>&plat=web&token=<IAAA>`
-//!   （**注意：在根 `/cas_iaaa_login`，不是 `/chapi/cas_iaaa_login`**）。成功 →
-//!   302 → `/web/iaaa_success?token=<JWT>`（HS256 access_token，前端存 localStorage），
-//!   并 Set-Cookie Laravel session（`XSRF-TOKEN`/`_session`）。
-//! - **API 鉴权**（HAR 实测成功的 `/chapi/api/v3/*` 请求）：Laravel session cookie
-//!   + `uuid` 头 + `X-XSRF-TOKEN` 头，**无 `Authorization`**（Bearer 是手机 app 路径）。
-//! - uuid 两段：完整 `Web_PKUHOLE_2.0.0_WEB_UUID_<v4hex>`（设备标识 + `uuid` 头），
-//!   但 IAAA redirectUrl + cas_iaaa_login 的 `?uuid=` 用其**尾 12 位 hex**。
+//!   （**根 `/cas_iaaa_login`，不是 `/chapi/cas_iaaa_login`**）。成功 → 302 →
+//!   `/web/iaaa_success?token=<JWT>`（HS256 access_token；从 `res.url()` query 取）。
+//! - **API 鉴权**（`/chapi/api/v3/*`）：`Authorization: Bearer <JWT>` + `uuid` 头 +
+//!   `userAgent: pku_web` 头。**有 Bearer**（早期被 HAR 脱敏 Cookie 头误导以为无；
+//!   401 body `{"message":"Token not provided"}` 证伪）。
+//! - **令牌验证门**（首次登录后 API 返 code=40002「请手机短信验证」，实为 IAAA 令牌
+//!   验证非短信）：GET `/api/title-otp`（提示）→ POST `/api/login_iaaa_check_token
+//!   {code}` → success。详见 `api::treehole::verify_otp`。
+//! - uuid 两段：完整 `Web_PKUHOLE_2.0.0_WEB_UUID_<v4hex>`（作 `uuid` 头），但 IAAA
+//!   redirectUrl + cas_iaaa_login 的 `?uuid=` 用其**尾 12 位 hex**。
 //! - 路径 base：登录走根（`/redirect_iaaa_login`、`/cas_iaaa_login`、`/web/`）；
-//!   API 走 `/chapi`。
+//!   OTP 类走根 `/api/`（`title-otp`、`login_iaaa_check_token`）；业务 API 走 `/chapi`。
 
 use anyhow::Context as _;
 use super::LowLevelClient;

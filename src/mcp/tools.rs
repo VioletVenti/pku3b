@@ -161,6 +161,10 @@ impl ToolRegistry {
                 let page = args.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
                 self.treehole_history(page, otp).await
             }
+            "treehole_attention" => {
+                let page = args.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
+                self.treehole_attention(page, otp).await
+            }
             other => return Err(ToolError::UnknownTool(other.to_string())),
         };
         result.map_err(|e| ToolError::Internal(format!("{e:#}")))
@@ -496,9 +500,9 @@ impl ToolRegistry {
     }
 
     // ---- treehole read tools (P3) ----------------------------------------
-    // 树洞鉴权：IAAA OTP → cas_iaaa_login → JWT；首次 API 调用可能返 code=40002（需
-    // 令牌验证门）。tools 层用 needs_otp 透传 40002——前端/MCP 用 login 工具补做令牌验证
-    //（verify_otp）。此处只做读，不碰写（写随 P3 Increment B）。
+    // 树洞鉴权：IAAA OTP → cas_iaaa_login → JWT；首次 API 调用可能返 code=40002（令牌
+    // 验证门，与 IAAA 登录 OTP 不同）。tools 层用专属 `needs_treehole_token` 状态透传
+    // 40002（不复用 needs_otp，避免前端误提示「IAAA 重新登录」）。此处只读，写随 Increment B。
 
     async fn treehole_with<F, Fut>(&self, otp: Option<&str>, f: F) -> anyhow::Result<Value>
     where
@@ -515,13 +519,9 @@ impl ToolRegistry {
             Ok(h) => h,
             Err(e) => {
                 let s = format!("{e:#}");
-                // 40002 = 需令牌验证门（首次登录后）。
+                // 40002 = 令牌验证门（首次登录后）。透传专属状态。
                 if s.contains("code=40002") {
-                    return Ok(json!({
-                        "status": "needs_otp",
-                        "mobile_mask": null,
-                        "hint": "树洞需要令牌验证（首次）。请重新触发一次（用 login 工具的 OTP 完成验证）后再查询。"
-                    }));
+                    return Ok(needs_treehole_token());
                 }
                 return Err(e);
             }
@@ -549,24 +549,19 @@ impl ToolRegistry {
     }
 
     async fn treehole_get(&self, pid: i64, otp: Option<&str>) -> anyhow::Result<Value> {
-        let cfg = self.cfg().await?;
-        let th = match auth::login_treehole(&self.client, &cfg, otp).await? {
-            LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
-            LoginOutcome::Ready(th) => th,
-        };
-        self.save_session().await;
-        let hole = th.get_hole(pid).await.map_err(|e| {
-            let s = format!("{e:#}");
-            if s.contains("code=40002") {
-                anyhow::anyhow!("needs_otp_gate")
-            } else {
-                e
+        // 复用 treehole_with（统一登录 + 40002 令牌门处理），取单帖包成 1 元素列表。
+        let v = self
+            .treehole_with(otp, move |th| async move {
+                th.get_hole(pid).await.map(|h| vec![h])
+            })
+            .await?;
+        // treehole_with 已是 ok 信封；单帖详情把 holes[0] 提到顶层更自然。
+        if v.get("status").and_then(|s| s.as_str()) == Some("ok") {
+            if let Some(h) = v.pointer("/data/holes/0") {
+                return Ok(ok(h.clone()));
             }
-        })?;
-        Ok(ok(json!({
-            "pid": hole.pid, "text": hole.text, "time": hole.time,
-            "reply": hole.reply, "likenum": hole.likenum, "tag": hole.tag,
-        })))
+        }
+        Ok(v) // needs_otp / needs_treehole_token / 其它 → 原样透传
     }
 
     async fn treehole_list_comments(&self, pid: i64, page: u32, otp: Option<&str>) -> anyhow::Result<Value> {
@@ -581,6 +576,11 @@ impl ToolRegistry {
 
     async fn treehole_history(&self, page: u32, otp: Option<&str>) -> anyhow::Result<Value> {
         self.treehole_with(otp, move |th| async move { th.history(page).await })
+            .await
+    }
+
+    async fn treehole_attention(&self, page: u32, otp: Option<&str>) -> anyhow::Result<Value> {
+        self.treehole_with(otp, move |th| async move { th.attention(page).await })
             .await
     }
 
@@ -957,6 +957,15 @@ fn tool_specs() -> Vec<ToolSpec> {
             })),
             read_only: true,
         },
+        ToolSpec {
+            name: "treehole_attention",
+            title: "树洞 · 关注",
+            description: "列出当前账号在树洞关注的帖子。",
+            input_schema: otp_optional_schema(json!({
+                "page": { "type": "integer", "description": "页码, 默认 1" }
+            })),
+            read_only: true,
+        },
     ]
 }
 
@@ -969,6 +978,15 @@ fn needs_otp(mobile_mask: Option<String>) -> Value {
         "status": "needs_otp",
         "mobile_mask": mobile_mask,
         "hint": "需要登录教学网。请用手机令牌 (OTP) 登录一次 (网页端登录入口 / login 工具), 之后无需重复输入。"
+    })
+}
+
+/// 树洞 40002 令牌验证门（首次登录后的 IAAA check_token 验证，不同于 needs_otp 的
+/// IAAA 登录 OTP）。专属状态，避免前端误提示「重新 IAAA 登录」。
+fn needs_treehole_token() -> Value {
+    json!({
+        "status": "needs_treehole_token",
+        "hint": "树洞首次使用需令牌验证。请在树洞面板/CLI 完成一次「令牌验证」（手机令牌）后重试。"
     })
 }
 

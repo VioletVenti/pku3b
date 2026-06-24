@@ -148,6 +148,17 @@ impl Treehole {
         Ok(d.list.into_iter().map(raw_to_hole).collect())
     }
 
+    /// 关注的帖子列表。
+    pub async fn attention(&self, page: u32) -> anyhow::Result<Vec<Hole>> {
+        #[derive(serde::Deserialize)]
+        struct D {
+            list: Vec<RawHole>,
+        }
+        let path = format!("/api/v3/hole/attention?page={page}&limit=20");
+        let d: D = self.get_v3(&path).await?;
+        Ok(d.list.into_iter().map(raw_to_hole).collect())
+    }
+
     // ---- 令牌验证门（首次登录后 API 返 code=40002 时用）----
 
     /// 取令牌提示（如「请输入北京大学App手机令牌」）。
