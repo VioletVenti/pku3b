@@ -66,17 +66,25 @@ async fn probe(ctx: &CommandCtx<'_>, otp: Option<String>) -> anyhow::Result<()> 
     let th = login_treehole(ctx, client, &cfg, otp_code).await?;
 
     println!("{}拉取 hole/list（Bearer JWT + uuid）…", BL);
-    match th.list_holes_raw().await {
-        Ok(body) => {
-            println!("{GR}{B}✓ hole/list 成功{B:#} ({} 字节)", body.len());
-            let preview: String = body.chars().take(600).collect();
-            println!("{D}{preview}{D:#}");
+    match th.list_holes(1, 5).await {
+        Ok(holes) => {
+            println!("{GR}{B}✓ hole/list 成功{B:#} ({} 条){GR:#}", holes.len());
+            for h in holes.iter().take(5) {
+                let preview: String = h.text.chars().take(60).collect();
+                println!(
+                    "{BL}[{}]{} {D}reply={} ♥={}{D:#} {}",
+                    h.pid, h.tag.as_deref().unwrap_or(""),
+                    h.reply, h.likenum, preview
+                );
+            }
         }
         Err(e) => {
-            println!("{RD}{B}✗ hole/list 失败{B:#}: {e:#}{RD:#}");
-            println!(
-                "{D}（若提示 code=40002 请手机短信验证，跑 `pku3b treehole verify`）{D:#}"
-            );
+            let s = format!("{e:#}");
+            if s.contains("40002") {
+                println!("{RD}✗ 需令牌验证（code=40002）。跑 `pku3b treehole verify` 后再试。{RD:#}");
+            } else {
+                println!("{RD}{B}✗ hole/list 失败{B:#}: {s}{RD:#}");
+            }
         }
     }
     Ok(())
@@ -134,19 +142,19 @@ async fn verify(ctx: &CommandCtx<'_>, otp: Option<String>) -> anyhow::Result<()>
     // 3. 提交验证（/api/login_iaaa_check_token {code}）。
     println!("{}提交令牌验证…", BL);
     match th.verify_otp(&code).await {
-        Ok(b) => println!(
-            "{GR}{B}✓ 验证响应{B:#}: {}{GR:#}",
-            b.chars().take(200).collect::<String>(),
-        ),
+        Ok(()) => println!("{GR}{B}✓ 令牌验证成功{B:#}{GR:#}"),
         Err(e) => println!("{RD}✗ 验证失败: {e:#}{RD:#}"),
     }
 
     // 4. 重读 hole/list 看是否通过。
     println!("{}重读 hole/list…", BL);
-    match th.list_holes_raw().await {
-        Ok(b) => {
-            println!("{GR}{B}✓ hole/list 成功{B:#} ({} 字节){GR:#}", b.len());
-            println!("{D}{}{D:#}", b.chars().take(400).collect::<String>());
+    match th.list_holes(1, 5).await {
+        Ok(holes) => {
+            println!("{GR}{B}✓ hole/list 成功{B:#} ({} 条){GR:#}", holes.len());
+            for h in holes.iter().take(3) {
+                let preview: String = h.text.chars().take(50).collect();
+                println!("{BL}[{}]{}{BL:#} {D}{}{D:#}", h.pid, h.tag.as_deref().unwrap_or(""), preview);
+            }
         }
         Err(e) => println!("{RD}✗ 仍失败: {e:#}{RD:#}"),
     }

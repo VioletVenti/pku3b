@@ -139,6 +139,28 @@ impl ToolRegistry {
                 let file_path = args.get("file_path").and_then(Value::as_str);
                 self.submit_assignment(assignment_id, file_path, otp).await
             }
+            "treehole_list" => {
+                let page = args.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
+                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as u32;
+                self.treehole_list(page, limit, otp).await
+            }
+            "treehole_get" => {
+                let pid = args.get("pid").and_then(Value::as_i64).unwrap_or(0);
+                self.treehole_get(pid, otp).await
+            }
+            "treehole_list_comments" => {
+                let pid = args.get("pid").and_then(Value::as_i64).unwrap_or(0);
+                let page = args.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
+                self.treehole_list_comments(pid, page, otp).await
+            }
+            "treehole_my_list" => {
+                let page = args.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
+                self.treehole_my_list(page, otp).await
+            }
+            "treehole_history" => {
+                let page = args.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
+                self.treehole_history(page, otp).await
+            }
             other => return Err(ToolError::UnknownTool(other.to_string())),
         };
         result.map_err(|e| ToolError::Internal(format!("{e:#}")))
@@ -473,6 +495,95 @@ impl ToolRegistry {
         }))
     }
 
+    // ---- treehole read tools (P3) ----------------------------------------
+    // 树洞鉴权：IAAA OTP → cas_iaaa_login → JWT；首次 API 调用可能返 code=40002（需
+    // 令牌验证门）。tools 层用 needs_otp 透传 40002——前端/MCP 用 login 工具补做令牌验证
+    //（verify_otp）。此处只做读，不碰写（写随 P3 Increment B）。
+
+    async fn treehole_with<F, Fut>(&self, otp: Option<&str>, f: F) -> anyhow::Result<Value>
+    where
+        F: FnOnce(api::treehole::Treehole) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Vec<api::treehole::Hole>>>,
+    {
+        let cfg = self.cfg().await?;
+        let th = match auth::login_treehole(&self.client, &cfg, otp).await? {
+            LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
+            LoginOutcome::Ready(th) => th,
+        };
+        self.save_session().await;
+        let holes = match f(th).await {
+            Ok(h) => h,
+            Err(e) => {
+                let s = format!("{e:#}");
+                // 40002 = 需令牌验证门（首次登录后）。
+                if s.contains("code=40002") {
+                    return Ok(json!({
+                        "status": "needs_otp",
+                        "mobile_mask": null,
+                        "hint": "树洞需要令牌验证（首次）。请重新触发一次（用 login 工具的 OTP 完成验证）后再查询。"
+                    }));
+                }
+                return Err(e);
+            }
+        };
+        let items: Vec<Value> = holes
+            .iter()
+            .map(|h| {
+                json!({
+                    "pid": h.pid,
+                    "text": h.text,
+                    "time": h.time,
+                    "timestamp": h.timestamp,
+                    "reply": h.reply,
+                    "likenum": h.likenum,
+                    "tag": h.tag,
+                })
+            })
+            .collect();
+        Ok(ok(json!({ "holes": items })))
+    }
+
+    async fn treehole_list(&self, page: u32, limit: u32, otp: Option<&str>) -> anyhow::Result<Value> {
+        self.treehole_with(otp, move |th| async move { th.list_holes(page, limit).await })
+            .await
+    }
+
+    async fn treehole_get(&self, pid: i64, otp: Option<&str>) -> anyhow::Result<Value> {
+        let cfg = self.cfg().await?;
+        let th = match auth::login_treehole(&self.client, &cfg, otp).await? {
+            LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
+            LoginOutcome::Ready(th) => th,
+        };
+        self.save_session().await;
+        let hole = th.get_hole(pid).await.map_err(|e| {
+            let s = format!("{e:#}");
+            if s.contains("code=40002") {
+                anyhow::anyhow!("needs_otp_gate")
+            } else {
+                e
+            }
+        })?;
+        Ok(ok(json!({
+            "pid": hole.pid, "text": hole.text, "time": hole.time,
+            "reply": hole.reply, "likenum": hole.likenum, "tag": hole.tag,
+        })))
+    }
+
+    async fn treehole_list_comments(&self, pid: i64, page: u32, otp: Option<&str>) -> anyhow::Result<Value> {
+        self.treehole_with(otp, move |th| async move { th.list_comments(pid, page).await })
+            .await
+    }
+
+    async fn treehole_my_list(&self, page: u32, otp: Option<&str>) -> anyhow::Result<Value> {
+        self.treehole_with(otp, move |th| async move { th.my_holes(page).await })
+            .await
+    }
+
+    async fn treehole_history(&self, page: u32, otp: Option<&str>) -> anyhow::Result<Value> {
+        self.treehole_with(otp, move |th| async move { th.history(page).await })
+            .await
+    }
+
     async fn get_grades(&self, otp: Option<&str>) -> anyhow::Result<Value> {
         let cfg = self.cfg().await?;
         let bb = match auth::login_blackboard(&self.client, &cfg, otp).await? {
@@ -796,6 +907,54 @@ fn tool_specs() -> Vec<ToolSpec> {
             description: "列出本学期各门课程的回放视频 (标题/时间/id), 按时间倒序。\
                           仅列出, 不下载。",
             input_schema: otp_optional_schema(json!({})),
+            read_only: true,
+        },
+        ToolSpec {
+            name: "treehole_list",
+            title: "树洞 · 帖子列表",
+            description: "列出北大树洞首页帖子流 (pid/正文/时间/回复数/点赞数/标签)。\
+                          首次调用可能返回 needs_otp (令牌验证门), 用 login 工具完成 OTP 后再查。",
+            input_schema: otp_optional_schema(json!({
+                "page": { "type": "integer", "description": "页码, 默认 1" },
+                "limit": { "type": "integer", "description": "每页条数, 默认 20" }
+            })),
+            read_only: true,
+        },
+        ToolSpec {
+            name: "treehole_get",
+            title: "树洞 · 帖子详情",
+            description: "获取树洞单帖 (楼主帖) 详情。pid 见 treehole_list。",
+            input_schema: otp_optional_schema(json!({
+                "pid": { "type": "integer", "description": "帖子 pid" }
+            })),
+            read_only: true,
+        },
+        ToolSpec {
+            name: "treehole_list_comments",
+            title: "树洞 · 楼层",
+            description: "列出某帖的楼层 (评论)。",
+            input_schema: otp_optional_schema(json!({
+                "pid": { "type": "integer", "description": "帖子 pid" },
+                "page": { "type": "integer", "description": "页码, 默认 1" }
+            })),
+            read_only: true,
+        },
+        ToolSpec {
+            name: "treehole_my_list",
+            title: "树洞 · 我的发帖",
+            description: "列出当前账号在树洞发布的帖子。",
+            input_schema: otp_optional_schema(json!({
+                "page": { "type": "integer", "description": "页码, 默认 1" }
+            })),
+            read_only: true,
+        },
+        ToolSpec {
+            name: "treehole_history",
+            title: "树洞 · 浏览历史",
+            description: "列出当前账号在树洞的浏览历史。",
+            input_schema: otp_optional_schema(json!({
+                "page": { "type": "integer", "description": "页码, 默认 1" }
+            })),
             read_only: true,
         },
     ]

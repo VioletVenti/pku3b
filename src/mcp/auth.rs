@@ -16,7 +16,7 @@
 //!   `portal_login_require_otp` *first* to avoid burning IAAA login attempts
 //!   (repeated failed attempts can trigger a half-hour lockout, IAAA code E21).
 
-use crate::api::{Client, blackboard::Blackboard, portal::Portal};
+use crate::api::{Client, blackboard::Blackboard, portal::Portal, treehole::Treehole};
 use crate::config::Config;
 
 /// Result of an attempted login: either a ready session handle, or a signal
@@ -70,4 +70,24 @@ pub async fn login_portal(
         .portal(&cfg.username, &cfg.password, otp.unwrap_or(""))
         .await?;
     Ok(LoginOutcome::Ready(portal))
+}
+
+/// Log in to 北大树洞 (treehole.pku.edu.cn, PKU Helper app). IAAA OTP →
+/// cas_iaaa_login → app-JWT. NOTE: treehole has a SECOND gate (code=40002) that
+/// needs the IAAA token re-submitted via `/api/login_iaaa_check_token` — that is
+/// driven by the tools layer (a read returns needs_otp when 40002); this helper
+/// only does the initial IAAA→JWT login.
+pub async fn login_treehole(
+    client: &Client,
+    cfg: &Config,
+    otp: Option<&str>,
+) -> anyhow::Result<LoginOutcome<Treehole>> {
+    // Same shape as portal: check OTP need first (avoid burning IAAA attempts).
+    if otp.is_none() && client.treehole_login_require_otp(&cfg.username).await? {
+        return Ok(LoginOutcome::NeedsOtp { mobile_mask: None });
+    }
+    let th = client
+        .treehole(&cfg.username, &cfg.password, otp.unwrap_or(""))
+        .await?;
+    Ok(LoginOutcome::Ready(th))
 }
