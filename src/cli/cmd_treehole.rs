@@ -106,24 +106,36 @@ async fn verify(ctx: &CommandCtx<'_>, otp: Option<String>) -> anyhow::Result<()>
 
     let th = login_treehole(ctx, client, &cfg, otp_code).await?;
 
-    // 1. 发送短信验证码。
-    println!("{}发送树洞短信验证码…", BL);
-    match th.send_sms().await {
-        Ok(b) => println!("{D}send_msg 响应: {}{D:#}", b.chars().take(200).collect::<String>()),
-        Err(e) => {
-            println!("{RD}✗ 发送短信失败: {e:#}{RD:#}");
-            return Ok(());
+    // 1. 取动态口令提示标题（bundle: getOtpTitle —— 令牌验证要输哪几位）。
+    println!("{}取验证码提示…", BL);
+    let title = match th.get_otp_title().await {
+        Ok(b) => {
+            println!("{D}title-otp 响应: {}{D:#}", b.chars().take(200).collect::<String>());
+            // 尝试从 {data:"..."} 取提示文案。
+            serde_json::from_str::<serde_json::Value>(&b)
+                .ok()
+                .and_then(|v| v.get("data").and_then(|d| d.as_str()).map(String::from))
+                .unwrap_or_default()
         }
-    }
+        Err(e) => {
+            println!("{RD}✗ 取标题失败: {e:#}{RD:#}");
+            String::new()
+        }
+    };
 
-    // 2. 用户输入收到的短信码。
-    let code = inquire::Text::new("请输入收到的树洞短信验证码: ").prompt()?;
+    // 2. 用户输入令牌码（IAAA 动态口令，按 title 提示的位数）。
+    let prompt = if title.is_empty() {
+        "请输入手机令牌（OTP）码（按提示位数）".to_string()
+    } else {
+        format!("请输入令牌码（提示：{title}）")
+    };
+    let code = inquire::Text::new(&prompt).prompt()?;
 
-    // 3. 提交验证（自动试字段名）。
-    println!("{}提交短信验证…", BL);
-    match th.verify_sms(&code).await {
-        Ok((field, b)) => println!(
-            "{GR}{B}✓ 验证响应{B:#} [字段={field}]: {}{GR:#}",
+    // 3. 提交验证（/api/login_iaaa_check_token {code}）。
+    println!("{}提交令牌验证…", BL);
+    match th.verify_otp(&code).await {
+        Ok(b) => println!(
+            "{GR}{B}✓ 验证响应{B:#}: {}{GR:#}",
             b.chars().take(200).collect::<String>(),
         ),
         Err(e) => println!("{RD}✗ 验证失败: {e:#}{RD:#}"),

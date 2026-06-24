@@ -45,42 +45,24 @@ impl Treehole {
             .await
     }
 
-    /// 触发短信验证码发送（首次登录后服务端要求「请手机短信验证」code=40002）。
-    /// 返回原始响应（探明字段）。
-    pub async fn send_sms(&self) -> anyhow::Result<String> {
-        // body 字段名未在 bundle 压缩里定位——先试空对象（手机号绑定在账号）。
+    /// 取验证码标题（动态口令提示，如「输入令牌第 N-M 位」）。bundle: getOtpTitle。
+    pub async fn get_otp_title(&self) -> anyhow::Result<String> {
         self.client
             .0
             .http_client
-            .treehole_api_post(&self.session, "/api/jwt_send_msg", "{}")
+            .treehole_api_get(&self.session, "/api/title-otp")
             .await
     }
 
-    /// 提交短信验证码完成验证。字段名 bundle 压缩里抓不到，依次试候选，首个不再
-    /// 返回 40001（"请填写短信验证码"）即命中。返回 (命中的字段名, 响应)。
-    pub async fn verify_sms(&self, code: &str) -> anyhow::Result<(String, String)> {
-        for field in ["smsCode", "verifyCode", "code", "msgCode", "otp", "sms_code"] {
-            let body = format!(r#"{{"{field}":"{code}"}}"#);
-            let resp = self
-                .client
-                .0
-                .http_client
-                .treehole_api_post(&self.session, "/api/jwt_msg_verify", &body)
-                .await?;
-            if !resp.contains("40001") {
-                return Ok((field.to_string(), resp));
-            }
-            log::warn!("[treehole] verify 字段 {field} 仍 40001，试下一个");
-        }
-        // 全部候选都 40001 —— 返回最后一次响应供诊断。
-        let body = format!(r#"{{"smsCode":"{code}"}}"#);
-        let resp = self
-            .client
+    /// 提交 IAAA 动态口令完成验证。OTP chunk 揭示：端点是 `/api/login_iaaa_check_token`
+    ///（不是 jwt_msg_verify），字段 `{code}`。bundle: `p(loginCheckOtp, {code})`。
+    pub async fn verify_otp(&self, code: &str) -> anyhow::Result<String> {
+        let body = format!(r#"{{"code":"{code}"}}"#);
+        self.client
             .0
             .http_client
-            .treehole_api_post(&self.session, "/api/jwt_msg_verify", &body)
-            .await?;
-        Ok(("?".to_string(), resp))
+            .treehole_api_post(&self.session, "/api/login_iaaa_check_token", &body)
+            .await
     }
 
     /// 暴露 session（probe 诊断用）。
