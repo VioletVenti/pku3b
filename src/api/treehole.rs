@@ -45,6 +45,27 @@ impl Treehole {
             .await
     }
 
+    /// 触发短信验证码发送（首次登录后服务端要求「请手机短信验证」code=40002）。
+    /// 返回原始响应（探明字段）。
+    pub async fn send_sms(&self) -> anyhow::Result<String> {
+        // body 字段名未在 bundle 压缩里定位——先试空对象（手机号绑定在账号）。
+        self.client
+            .0
+            .http_client
+            .treehole_api_post(&self.session, "/api/jwt_send_msg", "{}")
+            .await
+    }
+
+    /// 提交短信验证码完成验证。
+    pub async fn verify_sms(&self, code: &str) -> anyhow::Result<String> {
+        let body = format!(r#"{{"code":"{code}"}}"#);
+        self.client
+            .0
+            .http_client
+            .treehole_api_post(&self.session, "/api/jwt_msg_verify", &body)
+            .await
+    }
+
     /// 暴露 session（probe 诊断用）。
     pub fn session(&self) -> &TreeholeSession {
         &self.session

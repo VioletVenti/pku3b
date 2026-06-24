@@ -137,6 +137,37 @@ impl LowLevelClient {
         anyhow::ensure!(status.is_success(), "treehole {path} 失败: {status}\n{}", body);
         Ok(body)
     }
+
+    /// 鉴权 POST（同 treehole_api_get 的头集 + body）。spike 探测用，返回原始文本。
+    pub async fn treehole_api_post(
+        &self,
+        session: &TreeholeSession,
+        path: &str,
+        body: &str,
+    ) -> anyhow::Result<String> {
+        let url = format!("{TREEHOLE_API}{path}");
+        let api_url = url::Url::parse(TREEHOLE_API).unwrap();
+        let mut req = self
+            .http_client
+            .post(&url)?
+            .header("uuid", &session.uuid)?
+            .header("userAgent", "pku_web")?
+            .header("Accept", "application/json, text/plain, */*")?
+            .header("Content-Type", "application/json")?
+            .header("Referer", "https://treehole.pku.edu.cn/ch/web/pc/index")?;
+        if let Some(t) = &session.access_token {
+            req = req.header("Authorization", format!("Bearer {t}"))?;
+        }
+        if let Some(x) = self.http_client.cookie_value(&api_url, "XSRF-TOKEN") {
+            req = req.header("X-XSRF-TOKEN", x)?;
+        }
+        let res = req.body(body.to_owned()).send().await?;
+        let status = res.status();
+        let rb = res.text().await?;
+        log::info!("[treehole] POST {path} status={status} body[:120]={:?}", rb.chars().take(120).collect::<String>());
+        anyhow::ensure!(status.is_success(), "treehole POST {path} 失败: {status}\n{rb}");
+        Ok(rb)
+    }
 }
 /// 生成 web 端设备 UUID（HAR 实测格式）：`Web_PKUHOLE_2.0.0_WEB_UUID_<v4hex>`。
 /// bundle: `localStorage.pku-uuid = "Web_PKUHOLE_2.0.0_WEB_UUID_" + pz()`。
