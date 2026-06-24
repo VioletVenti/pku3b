@@ -80,12 +80,21 @@ impl Client {
         Ok(())
     }
 
-    /// Read a cookie's (URL-decoded) value by name + URL. Returns the *raw* cookie
-    /// value as the server set it; callers that need the URL-decoded form (e.g.
-    /// Laravel's XSRF-TOKEN, echoed back in the `X-XSRF-TOKEN` header) can decode.
+    /// Read a cookie's value by name. Tries a path/domain-aware match against
+    /// `url` first; if that misses (the cookie's stored path/domain may not match
+    /// the request URL exactly under pku3b's jar), falls back to scanning every
+    /// cookie in the jar. Returns the value exactly as stored (HAR confirms
+    /// Laravel's XSRF-TOKEN is stored already-decoded, so the X-XSRF-TOKEN header
+    /// echoes it verbatim — no further percent-decoding).
     pub fn cookie_value(&self, url: &url::Url, name: &str) -> Option<String> {
         let store = self.cookie_store.read().unwrap();
         for c in store.matches(url) {
+            if c.name() == name {
+                return Some(c.value().to_owned());
+            }
+        }
+        // Fallback: scan the whole jar (matches() can miss on path/domain edge cases).
+        for c in store.iter_any() {
             if c.name() == name {
                 return Some(c.value().to_owned());
             }

@@ -57,40 +57,27 @@ async fn probe(ctx: &CommandCtx<'_>, otp: Option<String>) -> anyhow::Result<()> 
 
     ctx.remove_spinner(sp);
 
-    println!("{}登录树洞（IAAA → cas_iaaa_login）…", BL);
+    println!("{}登录树洞（IAAA → cas_iaaa_login 建立 session）…", BL);
     let th = client
         .treehole(&cfg.username, &cfg.password, &otp_code)
         .await
         .context("树洞登录失败（见日志）")?;
 
-    if let Some(tok) = th.token() {
-        println!(
-            "{GR}{B}✓ 拿到 JWT{B:#}  access_token(len={})  uuid={}…",
-            tok.access_token.len(),
-            &tok.uuid.get(..8).unwrap_or(&tok.uuid),
-        );
-    } else {
-        println!(
-            "{GR}{B}✓ cas_iaaa_login 已通{B:#}（无 JWT，疑似 cookie 鉴权——将试 cookie-only 取数）"
-        );
-    }
+    println!(
+        "{GR}{B}✓ session 已建立{B:#}  uuid={}…",
+        th.session().uuid.get(..40).unwrap_or(&th.session().uuid),
+    );
 
-    println!("{}拉取 hole/list（先试 Bearer，再试 cookie-only）…", BL);
+    println!("{}拉取 hole/list（session cookie + uuid + X-XSRF-TOKEN）…", BL);
     match th.list_holes_raw().await {
-        Ok((path, body)) => {
-            println!(
-                "{GR}{B}✓ hole/list 成功{B:#} [{path} 路径] ({} 字节)",
-                body.len(),
-            );
-            // 打印前 600 字符，便于看到真实字段结构（spike 收集事实）。
+        Ok(body) => {
+            println!("{GR}{B}✓ hole/list 成功{B:#} ({} 字节)", body.len());
             let preview: String = body.chars().take(600).collect();
             println!("{D}{preview}{D:#}");
         }
         Err(e) => {
-            println!("{RD}{B}✗ hole/list 全部失败{B:#}: {e:#}{RD:#}");
-            println!(
-                "{D}（Bearer 与 cookie-only 都没通——看日志里的 [treehole-diag] 头/cookie，判真实鉴权形态）{D:#}"
-            );
+            println!("{RD}{B}✗ hole/list 失败{B:#}: {e:#}{RD:#}");
+            println!("{D}（见日志；可能 XSRF-TOKEN cookie 未落或 session 未生效）{D:#}");
         }
     }
     Ok(())
