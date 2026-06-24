@@ -110,18 +110,32 @@ impl LowLevelClient {
     ) -> anyhow::Result<String> {
         let url = format!("{TREEHOLE_API}{path}");
         let api_url = url::Url::parse(TREEHOLE_API).unwrap();
+        // HAR 实测成功请求的鉴权因子（无 Authorization）：
+        //   uuid + X-XSRF-TOKEN + userAgent:pku_web + Referer + session cookie。
         let mut req = self
             .http_client
             .get(&url)?
             .header("uuid", &session.uuid)?
-            .header("Referer", "https://treehole.pku.edu.cn/ch/web/")?;
+            .header("userAgent", "pku_web")?
+            .header("Accept", "application/json, text/plain, */*")?
+            .header("Referer", "https://treehole.pku.edu.cn/ch/web/pc/index")?;
         if let Some(x) = self.http_client.cookie_value(&api_url, "XSRF-TOKEN") {
             req = req.header("X-XSRF-TOKEN", x)?;
         }
         let res = req.send().await?;
         let status = res.status();
+        // 诊断：jar 里现有 cookie 名（判断 session 是否落了）。
+        let api_url2 = url::Url::parse(TREEHOLE_API).unwrap();
+        let jar_names: Vec<String> = {
+            let store = self.http_client.cookie_names(&api_url2);
+            store
+        };
+        log::info!(
+            "[treehole] GET {path} status={status} xsrf_present={} jar_cookies={:?}",
+            self.http_client.cookie_value(&api_url, "XSRF-TOKEN").is_some(),
+            jar_names,
+        );
         let body = res.text().await?;
-        log::debug!("[treehole] GET {path} status={status}");
         anyhow::ensure!(status.is_success(), "treehole {path} 失败: {status}\n{}", body);
         Ok(body)
     }
