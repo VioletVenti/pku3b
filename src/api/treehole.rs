@@ -203,6 +203,50 @@ impl Treehole {
         Ok(d.list.into_iter().map(RawBookmark::into_bm).collect())
     }
 
+    // ---- 写操作（发帖 / 回复）Increment B ----
+
+    /// 发帖（新树洞）。POST /api/v3/hole/post。返回新帖 pid。
+    pub async fn post_hole(&self, text: &str, tag: Option<&str>) -> anyhow::Result<i64> {
+        #[derive(serde::Deserialize)]
+        struct D {
+            pid: i64,
+        }
+        let mut obj = serde_json::json!({ "text": text });
+        if let Some(t) = tag {
+            obj["tag"] = serde_json::json!(t);
+        }
+        let d: D = self.post_v3("/api/v3/hole/post", &obj.to_string()).await?;
+        Ok(d.pid)
+    }
+
+    /// 回复楼层。POST /api/v3/comment/post。
+    pub async fn post_comment(&self, pid: i64, text: &str) -> anyhow::Result<i64> {
+        #[derive(serde::Deserialize)]
+        struct D {
+            cid: i64,
+        }
+        let body = serde_json::json!({ "pid": pid, "text": text }).to_string();
+        let d: D = self.post_v3("/api/v3/comment/post", &body).await?;
+        Ok(d.cid)
+    }
+
+    /// POST 一个 v3 端点，解析信封。
+    async fn post_v3<T: serde::de::DeserializeOwned>(&self, path: &str, body: &str) -> anyhow::Result<T> {
+        let resp = self
+            .client
+            .0
+            .http_client
+            .treehole_api_post(&self.session, path, body)
+            .await?;
+        let env: V3Envelope<T> = serde_json::from_str(&resp).map_err(|e| {
+            anyhow::anyhow!("解析树洞 POST 响应失败: {e}; body[:200]={}", resp.chars().take(200).collect::<String>())
+        })?;
+        if env.code == CODE_OK {
+            return env.data.ok_or_else(|| anyhow::anyhow!("树洞返回空 data（message={:?}）", env.message));
+        }
+        Err(anyhow::anyhow!("树洞 code={} message={:?}（path={path}）", env.code, env.message.unwrap_or_default()))
+    }
+
     // ---- 令牌验证门（首次登录后 API 返 code=40002 时用）----
 
     /// 取令牌提示（如「请输入北京大学App手机令牌」）。

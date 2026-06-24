@@ -179,6 +179,16 @@ impl ToolRegistry {
                 let mtype = args.get("message_type").and_then(Value::as_str).unwrap_or("int_msg");
                 self.treehole_unread(mtype, otp).await
             }
+            "treehole_post" => {
+                let text = args.get("text").and_then(Value::as_str).unwrap_or("");
+                let tag = args.get("tag").and_then(Value::as_str);
+                self.treehole_post(text, tag, otp).await
+            }
+            "treehole_comment" => {
+                let pid = args.get("pid").and_then(Value::as_i64).unwrap_or(0);
+                let text = args.get("text").and_then(Value::as_str).unwrap_or("");
+                self.treehole_comment(pid, text, otp).await
+            }
             other => return Err(ToolError::UnknownTool(other.to_string())),
         };
         result.map_err(|e| ToolError::Internal(format!("{e:#}")))
@@ -636,6 +646,38 @@ impl ToolRegistry {
         }
     }
 
+    // ---- treehole write tools (P3 Increment B) ----
+    // 发帖/回复是执行原语（read_only:false），经 PermissionGate 派发。和 submit_assignment
+    // 同模型：gate 决定 deny/confirm/auto，confirm→agent 两阶段审批，auto→直接执行。
+
+    async fn treehole_post(&self, text: &str, tag: Option<&str>, otp: Option<&str>) -> anyhow::Result<Value> {
+        let cfg = self.cfg().await?;
+        let th = match auth::login_treehole(&self.client, &cfg, otp).await? {
+            LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
+            LoginOutcome::Ready(th) => th,
+        };
+        self.save_session().await;
+        match th.post_hole(text, tag).await {
+            Ok(pid) => Ok(ok(json!({ "pid": pid, "posted": true }))),
+            Err(e) if format!("{e:#}").contains("code=40002") => Ok(needs_treehole_token()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn treehole_comment(&self, pid: i64, text: &str, otp: Option<&str>) -> anyhow::Result<Value> {
+        let cfg = self.cfg().await?;
+        let th = match auth::login_treehole(&self.client, &cfg, otp).await? {
+            LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
+            LoginOutcome::Ready(th) => th,
+        };
+        self.save_session().await;
+        match th.post_comment(pid, text).await {
+            Ok(cid) => Ok(ok(json!({ "cid": cid, "posted": true }))),
+            Err(e) if format!("{e:#}").contains("code=40002") => Ok(needs_treehole_token()),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn get_grades(&self, otp: Option<&str>) -> anyhow::Result<Value> {
         let cfg = self.cfg().await?;
         let bb = match auth::login_blackboard(&self.client, &cfg, otp).await? {
@@ -1047,6 +1089,27 @@ fn tool_specs() -> Vec<ToolSpec> {
             })),
             read_only: true,
         },
+        ToolSpec {
+            name: "treehole_post",
+            title: "树洞 · 发帖",
+            description: "在树洞发布一条新帖（有副作用）。这是权限闸的执行原语, 不直接暴露给 agent;\
+                          agent 通过 file_id-free 代理工具发起, 经权限矩阵确认后由闸派发。",
+            input_schema: otp_optional_schema(json!({
+                "text": { "type": "string", "description": "帖子正文" },
+                "tag": { "type": "string", "description": "标签 (可选)" }
+            })),
+            read_only: false,
+        },
+        ToolSpec {
+            name: "treehole_comment",
+            title: "树洞 · 回复",
+            description: "回复树洞某帖的楼层（有副作用）。执行原语, 经权限闸派发。",
+            input_schema: otp_optional_schema(json!({
+                "pid": { "type": "integer", "description": "目标帖子 pid" },
+                "text": { "type": "string", "description": "回复正文" }
+            })),
+            read_only: false,
+        },
     ]
 }
 
@@ -1087,13 +1150,17 @@ mod tests {
         assert!(names.contains(&"list_course_materials"));
         assert!(names.contains(&"list_videos"));
         assert!(names.contains(&"submit_assignment"));
-        // `login` and `submit_assignment` are the non-read-only tools; every other
-        // tool is read-only. submit_assignment is the side-effecting execution
-        // primitive (hidden from the agent on the consumer side, not here).
+        assert!(names.contains(&"treehole_post"));
+        assert!(names.contains(&"treehole_comment"));
+        // Non-read-only tools: login (session) + the 3 side-effecting write
+        // primitives (submit_assignment, treehole_post, treehole_comment). The
+        // write primitives are gated by the backend PermissionGate on the consumer
+        // side; here they're registered read_only:false.
+        let non_read_only = ["login", "submit_assignment", "treehole_post", "treehole_comment"];
         for s in &specs {
             assert_eq!(
                 s.read_only,
-                !(s.name == "login" || s.name == "submit_assignment"),
+                !non_read_only.contains(&s.name),
                 "read_only wrong for {}",
                 s.name
             );
