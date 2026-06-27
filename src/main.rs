@@ -3,6 +3,7 @@ extern crate directories as dirs;
 mod api;
 mod cli;
 mod config;
+mod credential;
 mod http;
 #[cfg(feature = "mcp")]
 mod mcp;

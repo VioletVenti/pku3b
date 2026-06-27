@@ -40,6 +40,14 @@ futures-util = { version = "0.3", features = [
     "async-await-macro",
 ], default-features = false }
 http = { version = "1.2.0", default-features = false }
+# OS keychain for credential encryption (feature `keychain`). Sync backends only
+# (sync-secret-service on Linux) — no async-runtime coupling, safe under compio.
+keyring = { version = "3", optional = true, default-features = false, features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+    "crypto-rust",
+] }
 image = { version = "0.25", optional = true, features = [
     "jpeg",
 ], default-features = false }
@@ -100,6 +108,12 @@ pdf = ["dep:lopdf", "dep:image"]
 # support for thesis.lib.pku.edu.cn login (JSEncrypt-compatible RSA)
 thesislib = ["dep:rsa", "dep:pkcs8", "dep:base64"]
 thesislib-pdf = ["thesislib", "pdf"]
+
+# encrypt credentials (password / ttshitu.password / bark.token) in the OS
+# keychain instead of plaintext cfg.toml. Not in `default` — a plaintext build
+# (forks, CI, boxes without libdbus) stays identity and degrades gracefully.
+# Build with: cargo build --features mcp,keychain
+keychain = ["dep:keyring"]
 
 [profile.release]
 lto = true
