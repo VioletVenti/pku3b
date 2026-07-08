@@ -647,8 +647,8 @@ impl ToolRegistry {
     }
 
     // ---- treehole write tools (P3 Increment B) ----
-    // 发帖/回复是执行原语（read_only:false），经 PermissionGate 派发。和 submit_assignment
-    // 同模型：gate 决定 deny/confirm/auto，confirm→agent 两阶段审批，auto→直接执行。
+    // 发帖/回复是执行原语（read_only:false）。和 submit_assignment 同模型：MCP 层只
+    // 暴露原语，是否需要用户确认由消费方（后端 harness 的权限管线）决定。
 
     async fn treehole_post(&self, text: &str, tag: Option<&str>, otp: Option<&str>) -> anyhow::Result<Value> {
         let cfg = self.cfg().await?;
@@ -1153,9 +1153,10 @@ mod tests {
         assert!(names.contains(&"treehole_post"));
         assert!(names.contains(&"treehole_comment"));
         // Non-read-only tools: login (session) + the 3 side-effecting write
-        // primitives (submit_assignment, treehole_post, treehole_comment). The
-        // write primitives are gated by the backend PermissionGate on the consumer
-        // side; here they're registered read_only:false.
+        // primitives (submit_assignment, treehole_post, treehole_comment). Whether
+        // a write primitive needs user confirmation is the consumer's call (the
+        // backend harness permission pipeline); here they're registered
+        // read_only:false.
         let non_read_only = ["login", "submit_assignment", "treehole_post", "treehole_comment"];
         for s in &specs {
             assert_eq!(
