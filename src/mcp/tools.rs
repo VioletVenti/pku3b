@@ -400,6 +400,7 @@ impl ToolRegistry {
         for handle in handles {
             let course = handle.get().await.context("获取课程")?;
             let course_name = course.meta().name().to_owned();
+            let course_id = course.meta().id().to_owned();
 
             for ah in Self::course_assignment_handles(&course).await {
                 let assignment = ah.get().await.context("获取作业详情")?;
@@ -407,10 +408,18 @@ impl ToolRegistry {
                 if !include_finished && submitted {
                     continue;
                 }
+                let attachments: Vec<&str> = assignment
+                    .attachments()
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect();
                 items.push(json!({
                     "id": ah.id(),
                     "course": course_name,
+                    "course_id": course_id,
                     "title": assignment.title(),
+                    "descriptions": assignment.descriptions(),
+                    "attachments": attachments,
                     "deadline": assignment.deadline().map(|d| d.to_rfc3339()),
                     "deadline_raw": assignment.deadline_raw(),
                     "submitted": submitted,
