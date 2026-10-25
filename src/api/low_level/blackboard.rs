@@ -269,11 +269,20 @@ impl LowLevelClient {
         Ok(rbody)
     }
 
-    pub async fn bb_course_content_file_uri(
+    /// Download a 「文件」 content item into `outdir`, returning the saved path.
+    ///
+    /// The content page's `document.location` points at `/bbcswebdav/...`, which
+    /// either redirects to the real file URL (older behaviour; the name is the last
+    /// path segment) or — as of 2026-10 — serves the file directly with 200, the
+    /// name then coming from `Content-Disposition`. `fallback_stem` + an extension
+    /// guessed from `Content-Type` is used when neither yields a name.
+    pub async fn bb_course_content_file_download(
         &self,
         course_id: &str,
         content_id: &str,
-    ) -> anyhow::Result<String> {
+        outdir: &std::path::Path,
+        fallback_stem: &str,
+    ) -> anyhow::Result<std::path::PathBuf> {
         let res = self
             .http_client
             .get(BB_CONTENT_FILE)?
@@ -285,16 +294,51 @@ impl LowLevelClient {
             ])?
             .send()
             .await?;
-
         let body = res.text().await?;
         let re = regex::Regex::new(r#"document.location = '(.*?)';"#).unwrap();
-        let caps = re.captures(&body).unwrap();
-        let loc = caps.get(1).unwrap().as_str();
-        log::debug!("redirected to {loc}");
+        let loc = re
+            .captures(&body)
+            .and_then(|c| c.get(1))
+            .context("file link (document.location) not found on content page")?
+            .as_str()
+            .to_owned();
+        log::debug!("content file link {loc}");
 
-        let res = self.get_by_uri(loc).await?;
-        let loc = extract_redirect_url(&res)?;
-        Ok(loc.to_owned())
+        let mut res = self.get_by_uri(&loc).await?;
+        let mut url_name = None;
+        if res.status().is_redirection() {
+            let next = extract_redirect_url(&res)?.to_owned();
+            url_name = next.rsplit_once('/').map(|(_, n)| percent_decode_str(n));
+            res = self.get_by_uri(&next).await?;
+        }
+        anyhow::ensure!(
+            res.status().is_success(),
+            "download status {}",
+            res.status()
+        );
+
+        let header = |k: &str| {
+            res.headers()
+                .get(k)
+                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        };
+        let name = header("content-disposition")
+            .and_then(|cd| filename_from_content_disposition(&cd))
+            .or(url_name)
+            .filter(|n| !n.trim().is_empty() && !n.starts_with("xid-"))
+            .unwrap_or_else(|| {
+                let ext = header("content-type").and_then(|ct| ext_from_content_type(&ct));
+                match ext {
+                    Some(ext) => format!("{fallback_stem}.{ext}"),
+                    None => fallback_stem.to_owned(),
+                }
+            });
+        let name = sanitize_file_name(&name);
+        let dest = outdir.join(&name);
+        let bytes = res.bytes().await?;
+        let r = compio::fs::write(&dest, bytes).await;
+        compio::buf::buf_try!(@try r);
+        Ok(dest)
     }
 }
 
@@ -313,5 +357,93 @@ impl LowLevelClient {
         let rbody = res.text().await?;
         let data: T = serde_json::from_str(&rbody)?;
         Ok(data)
+    }
+}
+
+fn percent_decode_str(s: &str) -> String {
+    percent_encoding::percent_decode(s.as_bytes())
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+/// `filename*=UTF-8''<pct-encoded>` wins over `filename="..."` (RFC 6266).
+fn filename_from_content_disposition(cd: &str) -> Option<String> {
+    let mut plain = None;
+    for part in cd.split(';').map(str::trim) {
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        let v = v.trim().trim_matches('"');
+        match k.trim().to_ascii_lowercase().as_str() {
+            "filename*" => {
+                let encoded = v.rsplit_once("''").map(|(_, e)| e).unwrap_or(v);
+                return Some(percent_decode_str(encoded));
+            }
+            "filename" => {
+                plain = Some(if v.contains('%') {
+                    percent_decode_str(v)
+                } else {
+                    v.to_owned()
+                })
+            }
+            _ => {}
+        }
+    }
+    plain
+}
+
+fn ext_from_content_type(ct: &str) -> Option<&'static str> {
+    let ct = ct.split(';').next()?.trim().to_ascii_lowercase();
+    Some(match ct.as_str() {
+        "application/pdf" => "pdf",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => "pptx",
+        "application/vnd.ms-powerpoint" => "ppt",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/msword" => "doc",
+        "application/zip" | "application/x-zip-compressed" => "zip",
+        "text/plain" => "txt",
+        _ => return None,
+    })
+}
+
+fn sanitize_file_name(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let s = s.trim().trim_start_matches('.').to_owned();
+    if s.is_empty() { "_".to_owned() } else { s }
+}
+
+#[cfg(test)]
+mod content_file_tests {
+    use super::*;
+
+    #[test]
+    fn content_disposition_names() {
+        assert_eq!(
+            filename_from_content_disposition(
+                "attachment; filename=\"x.pdf\"; filename*=UTF-8''%E7%AC%AC%E4%B8%80%E7%AB%A0.pdf"
+            )
+            .as_deref(),
+            Some("第一章.pdf")
+        );
+        assert_eq!(
+            filename_from_content_disposition("inline; filename=\"lec%201.pptx\"").as_deref(),
+            Some("lec 1.pptx")
+        );
+        assert_eq!(filename_from_content_disposition("inline").as_deref(), None);
+        assert_eq!(
+            ext_from_content_type("application/pdf; charset=binary"),
+            Some("pdf")
+        );
+        assert_eq!(ext_from_content_type("text/html"), None);
+        assert_eq!(sanitize_file_name("../a/b.pdf"), "_a_b.pdf");
     }
 }

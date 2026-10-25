@@ -226,22 +226,17 @@ pub async fn download(
     }
 
     if matches!(ct.kind(), CourseContentKind::File) {
-        let dest = outdir.join(ct.title());
-        let uri = c
+        let dest = c
             .client()
-            .bb_course_content_file_uri(ct.ccid().course_id(), ct.ccid().content_id())
-            .await?;
-        log::info!("File: {uri}");
-        let filename = uri.rsplit_once('/').unwrap().1;
-        let filename = percent_encoding::percent_decode(filename.as_bytes())
-            .decode_utf8_lossy()
-            .to_string();
-        println!("Downloading file {filename} to {}", dest.display());
-        let dest = outdir.join(&filename);
-        c.client()
-            .course_attachment_download(&uri, &dest, false)
+            .bb_course_content_file_download(
+                ct.ccid().course_id(),
+                ct.ccid().content_id(),
+                &outdir,
+                ct.title(),
+            )
             .await
-            .with_context(|| format!("download attachment '{filename}'"))?;
+            .with_context(|| format!("download file '{}'", ct.title()))?;
+        println!("Downloaded file to {}", dest.display());
     }
 
     let atts = ct.attachments();
