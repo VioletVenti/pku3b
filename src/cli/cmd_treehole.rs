@@ -73,15 +73,20 @@ async fn probe(ctx: &CommandCtx<'_>, otp: Option<String>) -> anyhow::Result<()> 
                 let preview: String = h.text.chars().take(60).collect();
                 println!(
                     "{BL}[{}]{} {D}reply={} ♥={}{D:#} {}",
-                    h.pid, h.tag.as_deref().unwrap_or(""),
-                    h.reply, h.likenum, preview
+                    h.pid,
+                    h.tag.as_deref().unwrap_or(""),
+                    h.reply,
+                    h.likenum,
+                    preview
                 );
             }
         }
         Err(e) => {
             let s = format!("{e:#}");
             if s.contains("40002") {
-                println!("{RD}✗ 需令牌验证（code=40002）。跑 `pku3b treehole verify` 后再试。{RD:#}");
+                println!(
+                    "{RD}✗ 需令牌验证（code=40002）。跑 `pku3b treehole verify` 后再试。{RD:#}"
+                );
             } else {
                 println!("{RD}{B}✗ hole/list 失败{B:#}: {s}{RD:#}");
             }
@@ -118,7 +123,10 @@ async fn verify(ctx: &CommandCtx<'_>, otp: Option<String>) -> anyhow::Result<()>
     println!("{}取验证码提示…", BL);
     let title = match th.get_otp_title().await {
         Ok(b) => {
-            println!("{D}title-otp 响应: {}{D:#}", b.chars().take(200).collect::<String>());
+            println!(
+                "{D}title-otp 响应: {}{D:#}",
+                b.chars().take(200).collect::<String>()
+            );
             // 尝试从 {data:"..."} 取提示文案。
             serde_json::from_str::<serde_json::Value>(&b)
                 .ok()
@@ -153,7 +161,12 @@ async fn verify(ctx: &CommandCtx<'_>, otp: Option<String>) -> anyhow::Result<()>
             println!("{GR}{B}✓ hole/list 成功{B:#} ({} 条){GR:#}", holes.len());
             for h in holes.iter().take(3) {
                 let preview: String = h.text.chars().take(50).collect();
-                println!("{BL}[{}]{}{BL:#} {D}{}{D:#}", h.pid, h.tag.as_deref().unwrap_or(""), preview);
+                println!(
+                    "{BL}[{}]{}{BL:#} {D}{}{D:#}",
+                    h.pid,
+                    h.tag.as_deref().unwrap_or(""),
+                    preview
+                );
             }
         }
         Err(e) => println!("{RD}✗ 仍失败: {e:#}{RD:#}"),
@@ -169,7 +182,10 @@ async fn login_treehole(
     otp_code: String,
 ) -> anyhow::Result<api::treehole::Treehole> {
     let _ = ctx;
-    println!("{}登录树洞（IAAA → cas_iaaa_login → iaaa_success JWT）…", BL);
+    println!(
+        "{}登录树洞（IAAA → cas_iaaa_login → iaaa_success JWT）…",
+        BL
+    );
     let th = client
         .treehole(&cfg.username, &cfg.password, &otp_code)
         .await

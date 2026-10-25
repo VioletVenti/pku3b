@@ -226,7 +226,10 @@ mod tests {
         // Once migrated, the value is ONLY in the keychain — without it the
         // field is unrecoverable (encryption's inherent cost).
         let store = MemStore::failing();
-        assert_eq!(resolve_value(&store, PASSWORD_KEY, "keyring:portal.password"), "");
+        assert_eq!(
+            resolve_value(&store, PASSWORD_KEY, "keyring:portal.password"),
+            ""
+        );
     }
 
     #[test]

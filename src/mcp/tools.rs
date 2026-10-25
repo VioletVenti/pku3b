@@ -28,6 +28,7 @@
 
 use anyhow::Context as _;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::auth::{self, LoginOutcome};
@@ -171,12 +172,18 @@ impl ToolRegistry {
                 self.treehole_search(keyword, page, otp).await
             }
             "treehole_messages" => {
-                let mtype = args.get("message_type").and_then(Value::as_str).unwrap_or("int_msg");
+                let mtype = args
+                    .get("message_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("int_msg");
                 let page = args.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
                 self.treehole_messages(mtype, page, otp).await
             }
             "treehole_unread" => {
-                let mtype = args.get("message_type").and_then(Value::as_str).unwrap_or("int_msg");
+                let mtype = args
+                    .get("message_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("int_msg");
                 self.treehole_unread(mtype, otp).await
             }
             "treehole_post" => {
@@ -567,9 +574,17 @@ impl ToolRegistry {
         Ok(ok(json!({ "holes": items })))
     }
 
-    async fn treehole_list(&self, page: u32, limit: u32, otp: Option<&str>) -> anyhow::Result<Value> {
-        self.treehole_with(otp, move |th| async move { th.list_holes(page, limit).await })
-            .await
+    async fn treehole_list(
+        &self,
+        page: u32,
+        limit: u32,
+        otp: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        self.treehole_with(
+            otp,
+            move |th| async move { th.list_holes(page, limit).await },
+        )
+        .await
     }
 
     async fn treehole_get(&self, pid: i64, otp: Option<&str>) -> anyhow::Result<Value> {
@@ -588,9 +603,17 @@ impl ToolRegistry {
         Ok(v) // needs_otp / needs_treehole_token / 其它 → 原样透传
     }
 
-    async fn treehole_list_comments(&self, pid: i64, page: u32, otp: Option<&str>) -> anyhow::Result<Value> {
-        self.treehole_with(otp, move |th| async move { th.list_comments(pid, page).await })
-            .await
+    async fn treehole_list_comments(
+        &self,
+        pid: i64,
+        page: u32,
+        otp: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        self.treehole_with(
+            otp,
+            move |th| async move { th.list_comments(pid, page).await },
+        )
+        .await
     }
 
     async fn treehole_my_list(&self, page: u32, otp: Option<&str>) -> anyhow::Result<Value> {
@@ -608,13 +631,23 @@ impl ToolRegistry {
             .await
     }
 
-    async fn treehole_search(&self, keyword: &str, page: u32, otp: Option<&str>) -> anyhow::Result<Value> {
+    async fn treehole_search(
+        &self,
+        keyword: &str,
+        page: u32,
+        otp: Option<&str>,
+    ) -> anyhow::Result<Value> {
         let kw = keyword.to_owned();
         self.treehole_with(otp, move |th| async move { th.search(&kw, page, 20).await })
             .await
     }
 
-    async fn treehole_messages(&self, mtype: &str, page: u32, otp: Option<&str>) -> anyhow::Result<Value> {
+    async fn treehole_messages(
+        &self,
+        mtype: &str,
+        page: u32,
+        otp: Option<&str>,
+    ) -> anyhow::Result<Value> {
         let cfg = self.cfg().await?;
         let th = match auth::login_treehole(&self.client, &cfg, otp).await? {
             LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
@@ -624,11 +657,18 @@ impl ToolRegistry {
         let msgs = th.messages(mtype, page).await.map_err(|e| {
             if format!("{e:#}").contains("code=40002") {
                 anyhow::anyhow!("needs_treehole_token")
-            } else { e }
+            } else {
+                e
+            }
         })?;
-        let items: Vec<Value> = msgs.iter().map(|m| json!({
-            "description": m.description, "pid": m.pid, "time": m.time,
-        })).collect();
+        let items: Vec<Value> = msgs
+            .iter()
+            .map(|m| {
+                json!({
+                    "description": m.description, "pid": m.pid, "time": m.time,
+                })
+            })
+            .collect();
         Ok(ok(json!({ "messages": items })))
     }
 
@@ -650,7 +690,12 @@ impl ToolRegistry {
     // 发帖/回复是执行原语（read_only:false）。和 submit_assignment 同模型：MCP 层只
     // 暴露原语，是否需要用户确认由消费方（后端 harness 的权限管线）决定。
 
-    async fn treehole_post(&self, text: &str, tag: Option<&str>, otp: Option<&str>) -> anyhow::Result<Value> {
+    async fn treehole_post(
+        &self,
+        text: &str,
+        tag: Option<&str>,
+        otp: Option<&str>,
+    ) -> anyhow::Result<Value> {
         let cfg = self.cfg().await?;
         let th = match auth::login_treehole(&self.client, &cfg, otp).await? {
             LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
@@ -664,7 +709,12 @@ impl ToolRegistry {
         }
     }
 
-    async fn treehole_comment(&self, pid: i64, text: &str, otp: Option<&str>) -> anyhow::Result<Value> {
+    async fn treehole_comment(
+        &self,
+        pid: i64,
+        text: &str,
+        otp: Option<&str>,
+    ) -> anyhow::Result<Value> {
         let cfg = self.cfg().await?;
         let th = match auth::login_treehole(&self.client, &cfg, otp).await? {
             LoginOutcome::NeedsOtp { mobile_mask } => return Ok(needs_otp(mobile_mask)),
@@ -798,6 +848,7 @@ impl ToolRegistry {
         for handle in handles {
             let course = handle.get().await.context("获取课程")?;
             let course_name = course.meta().name().to_owned();
+            let course_id = course.meta().id().to_owned();
 
             let mut stream = course.content_stream();
             let mut contents = Vec::new();
@@ -805,7 +856,21 @@ impl ToolRegistry {
                 contents.extend(batch);
             }
 
+            // content_id → (title, parent): menu entries are roots, folders are inner nodes.
+            let mut nodes: HashMap<String, (String, Option<String>)> = course
+                .entry_content_ids()
+                .into_iter()
+                .map(|(name, id)| (id, (name, None)))
+                .collect();
+            for data in &contents {
+                nodes.insert(
+                    data.id().to_owned(),
+                    (data.title().to_owned(), data.parent().map(str::to_owned)),
+                );
+            }
+
             for data in contents {
+                let path = content_path(&nodes, data.parent());
                 let ct = course.build_content(data);
                 // Skip kinds already surfaced elsewhere.
                 if matches!(
@@ -817,10 +882,12 @@ impl ToolRegistry {
                 }
                 items.push(json!({
                     "course": course_name,
+                    "course_id": course_id,
                     "ccid": ct.ccid().to_string(),
                     "title": ct.title(),
                     "kind": kind_label(ct.kind()),
                     "attachment_count": ct.attachments().len(),
+                    "path": path,
                 }));
             }
         }
@@ -851,12 +918,14 @@ impl ToolRegistry {
         for handle in handles {
             let course = handle.get().await.context("获取课程")?;
             let course_name = course.meta().name().to_owned();
+            let course_id = course.meta().id().to_owned();
             let videos = course.get_video_list().await.context("获取课程回放列表")?;
             for v in videos {
                 let m = v.meta();
                 items.push(json!({
                     "id": v.id(),
                     "course": course_name,
+                    "course_id": course_id,
                     "title": m.title(),
                     "time": m.time(),
                 }));
@@ -899,6 +968,25 @@ fn otp_optional_schema(extra: Value) -> Value {
 /// (作业/音频/内容文件夹/项目/文件/测试), so this is a faithful localization —
 /// never a Rust `Debug` name on the wire (which leaked English like `[Document]`
 /// into the UI).
+/// `/`-joined titles from the menu-entry root down to `parent` (inclusive).
+/// Empty when the parent is unknown (pre-`parent` cache) or the walk hits a cycle.
+fn content_path(nodes: &HashMap<String, (String, Option<String>)>, parent: Option<&str>) -> String {
+    let mut titles = Vec::new();
+    let mut cur = parent.map(str::to_owned);
+    while let Some(id) = cur {
+        let Some((title, up)) = nodes.get(&id) else {
+            break;
+        };
+        if titles.len() > nodes.len() {
+            return String::new();
+        }
+        titles.push(title.trim().to_owned());
+        cur = up.clone();
+    }
+    titles.reverse();
+    titles.join("/")
+}
+
 fn kind_label(kind: &api::blackboard::CourseContentKind) -> &'static str {
     use api::blackboard::CourseContentKind as K;
     match kind {
@@ -1157,7 +1245,12 @@ mod tests {
         // a write primitive needs user confirmation is the consumer's call (the
         // backend harness permission pipeline); here they're registered
         // read_only:false.
-        let non_read_only = ["login", "submit_assignment", "treehole_post", "treehole_comment"];
+        let non_read_only = [
+            "login",
+            "submit_assignment",
+            "treehole_post",
+            "treehole_comment",
+        ];
         for s in &specs {
             assert_eq!(
                 s.read_only,
@@ -1281,6 +1374,35 @@ mod tests {
         assert_eq!(n["status"], "needs_otp");
         assert_eq!(n["mobile_mask"], "135****1234");
         assert!(n["hint"].as_str().unwrap().contains("OTP"));
+    }
+
+    #[test]
+    fn content_path_walks_to_menu_root() {
+        let nodes: HashMap<String, (String, Option<String>)> = [
+            ("root".to_owned(), ("教学资料".to_owned(), None)),
+            (
+                "f1".to_owned(),
+                ("第三章 栈".to_owned(), Some("root".to_owned())),
+            ),
+            (
+                "f2".to_owned(),
+                (" 课件 ".to_owned(), Some("f1".to_owned())),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(content_path(&nodes, Some("f2")), "教学资料/第三章 栈/课件");
+        assert_eq!(content_path(&nodes, Some("root")), "教学资料");
+        assert_eq!(content_path(&nodes, None), "");
+        assert_eq!(content_path(&nodes, Some("missing")), "");
+
+        let cyclic: HashMap<String, (String, Option<String>)> = [
+            ("a".to_owned(), ("A".to_owned(), Some("b".to_owned()))),
+            ("b".to_owned(), ("B".to_owned(), Some("a".to_owned()))),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(content_path(&cyclic, Some("a")), "");
     }
 
     #[test]

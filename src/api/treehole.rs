@@ -183,12 +183,17 @@ impl Treehole {
     }
 
     /// 消息列表（通知——关注帖子的新回复等）。
-    pub async fn messages(&self, message_type: &str, page: u32) -> anyhow::Result<Vec<TreeholeMessage>> {
+    pub async fn messages(
+        &self,
+        message_type: &str,
+        page: u32,
+    ) -> anyhow::Result<Vec<TreeholeMessage>> {
         #[derive(serde::Deserialize)]
         struct D {
             list: Vec<RawMessage>,
         }
-        let path = format!("/api/v3/message/index?message_type={message_type}&page={page}&limit=20");
+        let path =
+            format!("/api/v3/message/index?message_type={message_type}&page={page}&limit=20");
         let d: D = self.get_v3(&path).await?;
         Ok(d.list.into_iter().map(RawMessage::into_msg).collect())
     }
@@ -231,7 +236,11 @@ impl Treehole {
     }
 
     /// POST 一个 v3 端点，解析信封。
-    async fn post_v3<T: serde::de::DeserializeOwned>(&self, path: &str, body: &str) -> anyhow::Result<T> {
+    async fn post_v3<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &str,
+    ) -> anyhow::Result<T> {
         let resp = self
             .client
             .0
@@ -239,12 +248,21 @@ impl Treehole {
             .treehole_api_post(&self.session, path, body)
             .await?;
         let env: V3Envelope<T> = serde_json::from_str(&resp).map_err(|e| {
-            anyhow::anyhow!("解析树洞 POST 响应失败: {e}; body[:200]={}", resp.chars().take(200).collect::<String>())
+            anyhow::anyhow!(
+                "解析树洞 POST 响应失败: {e}; body[:200]={}",
+                resp.chars().take(200).collect::<String>()
+            )
         })?;
         if env.code == CODE_OK {
-            return env.data.ok_or_else(|| anyhow::anyhow!("树洞返回空 data（message={:?}）", env.message));
+            return env
+                .data
+                .ok_or_else(|| anyhow::anyhow!("树洞返回空 data（message={:?}）", env.message));
         }
-        Err(anyhow::anyhow!("树洞 code={} message={:?}（path={path}）", env.code, env.message.unwrap_or_default()))
+        Err(anyhow::anyhow!(
+            "树洞 code={} message={:?}（path={path}）",
+            env.code,
+            env.message.unwrap_or_default()
+        ))
     }
 
     // ---- 令牌验证门（首次登录后 API 返 code=40002 时用）----

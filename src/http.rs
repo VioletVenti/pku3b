@@ -105,7 +105,11 @@ impl Client {
     /// All cookie names in the jar matching `url` (diagnostics).
     pub fn cookie_names(&self, url: &url::Url) -> Vec<String> {
         let store = self.cookie_store.read().unwrap();
-        let mut out: Vec<String> = store.matches(url).iter().map(|c| c.name().to_owned()).collect();
+        let mut out: Vec<String> = store
+            .matches(url)
+            .iter()
+            .map(|c| c.name().to_owned())
+            .collect();
         if out.is_empty() {
             out = store.iter_any().map(|c| c.name().to_owned()).collect();
         }

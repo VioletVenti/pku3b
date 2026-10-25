@@ -17,8 +17,8 @@
 //! - 路径 base：登录走根（`/redirect_iaaa_login`、`/cas_iaaa_login`、`/web/`）；
 //!   OTP 类走根 `/api/`（`title-otp`、`login_iaaa_check_token`）；业务 API 走 `/chapi`。
 
-use anyhow::Context as _;
 use super::LowLevelClient;
+use anyhow::Context as _;
 
 /// IAAA appid —— 树洞走「PKU Helper」。
 pub const TREEHOLE_APP_ID: &str = "PKU Helper";
@@ -46,7 +46,9 @@ pub struct TreeholeSession {
 impl LowLevelClient {
     /// 是否需要 OTP（复用 IAAA 通用判定，appid = PKU Helper）。
     pub async fn treehole_login_require_otp(&self, username: &str) -> anyhow::Result<bool> {
-        let data = self.iaaa_is_mobile_authen(TREEHOLE_APP_ID, username).await?;
+        let data = self
+            .iaaa_is_mobile_authen(TREEHOLE_APP_ID, username)
+            .await?;
         Ok(data.authen_mode == "OTP")
     }
 
@@ -75,9 +77,8 @@ impl LowLevelClient {
         // iaaa_success；从其 query 取 JWT。过程中 cas_iaaa_login 的 Set-Cookie（Laravel
         // session）由 send() 在最终响应采集——但 302 的 Set-Cookie 会丢，故下面也兜底
         // 直访 iaaa_success 让其 cookie 落 jar。
-        let cas_url = format!(
-            "{TREEHOLE_CAS_LOGIN}?uuid={uuid_tail}&plat=web&_rand=0&token={token}"
-        );
+        let cas_url =
+            format!("{TREEHOLE_CAS_LOGIN}?uuid={uuid_tail}&plat=web&_rand=0&token={token}");
         let res = self.http_client.get(&cas_url)?.send().await?;
         let final_url = res.url().clone();
         let status = res.status();
@@ -89,7 +90,10 @@ impl LowLevelClient {
             .find(|(k, _)| k == "token")
             .map(|(_, v)| v.to_string());
         if let Some(t) = &access_token {
-            log::info!("[treehole] access_token (JWT) acquired from iaaa_success (len={})", t.len());
+            log::info!(
+                "[treehole] access_token (JWT) acquired from iaaa_success (len={})",
+                t.len()
+            );
         } else {
             log::warn!("[treehole] 未能从 iaaa_success URL 取 access_token（final={final_url}）");
         }
@@ -136,9 +140,15 @@ impl LowLevelClient {
         log::info!(
             "[treehole] GET {path} status={status} bearer={} xsrf={}",
             session.access_token.is_some(),
-            self.http_client.cookie_value(&api_url, "XSRF-TOKEN").is_some(),
+            self.http_client
+                .cookie_value(&api_url, "XSRF-TOKEN")
+                .is_some(),
         );
-        anyhow::ensure!(status.is_success(), "treehole {path} 失败: {status}\n{}", body);
+        anyhow::ensure!(
+            status.is_success(),
+            "treehole {path} 失败: {status}\n{}",
+            body
+        );
         Ok(body)
     }
 
@@ -168,8 +178,14 @@ impl LowLevelClient {
         let res = req.body(body.to_owned()).send().await?;
         let status = res.status();
         let rb = res.text().await?;
-        log::info!("[treehole] POST {path} status={status} body[:120]={:?}", rb.chars().take(120).collect::<String>());
-        anyhow::ensure!(status.is_success(), "treehole POST {path} 失败: {status}\n{rb}");
+        log::info!(
+            "[treehole] POST {path} status={status} body[:120]={:?}",
+            rb.chars().take(120).collect::<String>()
+        );
+        anyhow::ensure!(
+            status.is_success(),
+            "treehole POST {path} 失败: {status}\n{rb}"
+        );
         Ok(rb)
     }
 }
@@ -198,7 +214,9 @@ fn uuid_v4_hex() -> String {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let hi = t.wrapping_mul(0x9E3779B97F4A7C15) ^ n.rotate_left(13);
-    let lo = t.rotate_left(27).wrapping_add(n.wrapping_mul(0xD1B54A32D192ED03));
+    let lo = t
+        .rotate_left(27)
+        .wrapping_add(n.wrapping_mul(0xD1B54A32D192ED03));
     let v4_lo = (lo >> 48) & 0x0FFF | 0x4000;
     let var = (lo >> 60) & 0x3 | 0x8;
     format!(

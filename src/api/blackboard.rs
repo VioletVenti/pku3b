@@ -455,20 +455,29 @@ impl Course {
         CourseContentStream::new(
             self.client.clone(),
             self.meta.clone(),
-            self.entries()
-                .values()
-                .filter_map(|uri| {
-                    let url = low_level::convert_uri(uri).ok()?.into_url().ok()?;
-                    if !low_level::blackboard::LIST_CONTENT.ends_with(url.path()) {
-                        return None;
-                    }
-
-                    let (_, content_id) = url.query_pairs().find(|(k, _)| k == "content_id")?;
-
-                    Some(content_id.to_string())
-                })
+            self.entry_content_ids()
+                .into_iter()
+                .map(|(_, content_id)| content_id)
                 .collect(),
         )
+    }
+
+    /// Left-menu entries that are content lists, as `(entry name, content_id)`.
+    /// These are the roots of the content tree walked by [`Self::content_stream`].
+    pub fn entry_content_ids(&self) -> Vec<(String, String)> {
+        self.entries()
+            .iter()
+            .filter_map(|(name, uri)| {
+                let url = low_level::convert_uri(uri).ok()?.into_url().ok()?;
+                if !low_level::blackboard::LIST_CONTENT.ends_with(url.path()) {
+                    return None;
+                }
+
+                let (_, content_id) = url.query_pairs().find(|(k, _)| k == "content_id")?;
+
+                Some((name.trim().to_owned(), content_id.to_string()))
+            })
+            .collect()
     }
 
     pub fn build_content(&self, data: CourseContentData) -> CourseContent {
@@ -624,6 +633,7 @@ impl Course {
                 } else {
                     None
                 },
+                parent: None,
             };
 
             announcements.push(CourseAnnouncementHandle {
@@ -673,7 +683,7 @@ impl CourseContentStream {
         let doms = futures_util::future::join_all(futs).await;
 
         let mut all_contents = Vec::new();
-        for dom in doms {
+        for (page_id, dom) in ids.iter().zip(doms) {
             let dom = dom?;
             let selector = Selector::parse("#content_listContainer > li").unwrap();
             let contents = dom
@@ -682,6 +692,10 @@ impl CourseContentStream {
                     CourseContentData::from_element(li)
                         .inspect_err(|e| log::warn!("CourseContentData::from_element error: {e}"))
                         .ok()
+                })
+                .map(|mut data| {
+                    data.parent = Some(page_id.to_owned());
+                    data
                 })
                 // filter out visited ids
                 .filter(|data| self.visited_ids.insert(data.id.to_owned()))
@@ -824,6 +838,10 @@ pub struct CourseContentData {
     attachments: Vec<(String, String)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     time: Option<String>,
+    /// content_id of the page this item was listed on (a menu entry or a folder);
+    /// `None` for items from caches written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent: Option<String>,
 }
 
 fn collect_text(element: scraper::ElementRef) -> String {
@@ -863,6 +881,18 @@ fn announcement_dedup_key(title: &str, content: &str, time: &str) -> String {
 }
 
 impl CourseContentData {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn parent(&self) -> Option<&str> {
+        self.parent.as_deref()
+    }
+
     fn from_element(el: scraper::ElementRef<'_>) -> anyhow::Result<Self> {
         anyhow::ensure!(el.value().name() == "li", "not a li element");
         let (img, title_div, detail_div) = el
@@ -938,6 +968,7 @@ impl CourseContentData {
             descriptions,
             attachments,
             time: None,
+            parent: None,
         })
     }
 }
