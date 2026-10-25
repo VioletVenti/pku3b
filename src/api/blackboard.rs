@@ -40,17 +40,19 @@ impl Client {
         redir: bool,
     ) -> anyhow::Result<()> {
         log::debug!("downloading attachment from {uri}");
-        let uri = if redir {
-            let res = self.get_by_uri(uri).await?;
-            let loc = low_level::extract_redirect_url(&res)?;
+        let mut res = self.get_by_uri(uri).await?;
+        // `redir`: the link used to always 302 to the real file; since 2026-10
+        // course.pku.edu.cn may serve the file directly, so follow only if asked to.
+        if redir && res.status().is_redirection() {
+            let loc = low_level::extract_redirect_url(&res)?.to_owned();
             log::debug!("redirected to {loc}");
-            loc.to_owned()
-        } else {
-            uri.to_owned()
-        };
-
-        let res = self.get_by_uri(&uri).await?;
-        anyhow::ensure!(res.status().is_success(), "status not success");
+            res = self.get_by_uri(&loc).await?;
+        }
+        anyhow::ensure!(
+            res.status().is_success(),
+            "status not success: {}",
+            res.status()
+        );
 
         let rbody = res.bytes().await?;
         let r = compio::fs::write(dest, rbody).await;

@@ -65,12 +65,16 @@ pub async fn run(cmd: CommandAssignment, ctx: &CommandCtx<'_>) -> anyhow::Result
             list(ctx, cmd.force, all || all_term, !all_term, cmd.otp_code).await?
         }
         AssignmentCommands::Download { id, dir, all_term } => {
+            // An explicit id must also resolve already-submitted assignments
+            // (their statements are still needed); the interactive picker keeps
+            // showing only unfinished ones.
+            let all = all_term || id.is_some();
             download(
                 ctx,
                 id.as_deref(),
                 &dir,
                 cmd.force,
-                all_term,
+                all,
                 !all_term,
                 cmd.otp_code,
             )
